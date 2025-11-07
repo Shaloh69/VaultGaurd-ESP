@@ -1,5 +1,5 @@
 /*
- * ESP32 Electrical Safety Monitor - ENHANCED VERSION v4.0
+ * Vaulter - ENHANCED VERSION v4.0
  * 
  * MAJOR IMPROVEMENTS:
  * - Non-blocking architecture with state machine
@@ -14,9 +14,14 @@
  * - Comprehensive diagnostics
  * - Safer watchdog handling
  * - Graceful degradation on sensor failure
+ * 
+ * MODIFIED: 
+ * - SSR is ALWAYS ON by default, turns OFF only during anomalies
+ * - Automatic periodic calibration every 2 minutes
  */
 
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 #include <esp_task_wdt.h>
@@ -33,6 +38,15 @@
 #define BUZZER_PIN          19
 #define PIR_SENSOR_PIN      18
 #define SD_CS_PIN           15
+
+// ==================== WIFI & SERVER CONFIGURATION ====================
+// **IMPORTANT: Change these to match your network and server!**
+#define WIFI_SSID           "YOUR_WIFI_SSID"        // Change this!
+#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"    // Change this!
+#define SERVER_URL          "http://192.168.1.100:3000"  // Change this to your server IP!
+#define DEVICE_ID           "ESP32_001"             // Unique ID for this device
+#define WIFI_TIMEOUT_MS     20000                   // WiFi connection timeout
+#define SERVER_SEND_INTERVAL 5000                   // Send data every 5 seconds
 
 // ==================== ADC CONFIGURATION ====================
 #define ADC_RESOLUTION      4096.0
@@ -80,6 +94,7 @@
 #define SAMPLE_RATE         1000
 #define DISPLAY_INTERVAL    2000
 #define CALIBRATION_SAMPLES 500
+#define CALIBRATION_INTERVAL_MS 120000  // Auto-calibrate every 2 minutes
 #define MOVING_AVERAGE_SIZE 10
 #define WATCHDOG_TIMEOUT_S  30
 #define LOG_INTERVAL_MS     5000
@@ -116,13 +131,17 @@ enum CalibrationState {
 // ==================== GLOBAL VARIABLES ====================
 SystemState currentState = STATE_INITIALIZING;
 CalibrationState calState = CAL_IDLE;
-bool ssrEnabled = false;
-bool ssrCommandState = false;
+bool ssrEnabled = true;  // MODIFIED: Start with SSR ON
+bool ssrCommandState = true;  // MODIFIED: Command state also ON
+bool ssrStateBeforeCalibration = false;  // Track SSR state before auto-calibration
+bool autoCalibrationInProgress = false;  // Flag for automatic periodic calibration
 bool manualControl = false;
 bool safetyEnabled = true;
 bool buzzerEnabled = true;
 bool sdCardAvailable = false;
 bool wifiEnabled = false;
+bool wifiConnected = false;
+bool serverConnected = false;
 bool sensorsValid = false;
 bool criticalError = false;
 
@@ -179,6 +198,9 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastEnergyUpdate = 0;
 unsigned long lastLogUpdate = 0;
 unsigned long lastSSRVerify = 0;
+unsigned long lastCalibrationTime = 0;
+unsigned long lastServerSend = 0;
+unsigned long lastWiFiCheck = 0;
 unsigned long systemStartTime = 0;
 unsigned long lastWatchdogFeed = 0;
 unsigned long lastSampleTime = 0;
@@ -251,6 +273,10 @@ void verifyCalibration();
 void updatePerformanceMetrics(unsigned long loopTime);
 bool isSafeToOperate();
 void handleBrownout();
+void connectToWiFi();
+void checkWiFiConnection();
+void sendDataToServer();
+bool sendHTTPRequest(const char* endpoint, const char* jsonData);
 
 // ==================== SETUP FUNCTION ====================
 void setup() {
@@ -261,6 +287,8 @@ void setup() {
   Serial.println(F("\n========================================"));
   Serial.println(F("ESP32 Electrical Safety Monitor"));
   Serial.println(F("ENHANCED VERSION v4.0"));
+  Serial.println(F("MODIFIED: SSR NORMALLY ON"));
+  Serial.println(F("AUTO-CALIBRATION: Every 2 Minutes"));
   Serial.println(F("========================================"));
   
   EEPROM.begin(EEPROM_SIZE);
@@ -271,7 +299,8 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIR_SENSOR_PIN, INPUT);
   
-  digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+  // MODIFIED: Start with SSR ON instead of OFF
+  digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
@@ -287,11 +316,16 @@ void setup() {
   setupWatchdog();
   initSDCard();
   
+  // Initialize WiFi connection
+  Serial.println(F("\n=== WIFI INITIALIZATION ==="));
+  connectToWiFi();
+  
   if (!loadCalibrationData()) {
     Serial.println(F("⚠️  Using default calibration values"));
   }
   
   systemStartTime = millis();
+  lastCalibrationTime = millis();  // Initialize for periodic calibration
   currentState = STATE_CALIBRATING;
   calState = CAL_IDLE;
   
@@ -300,6 +334,9 @@ void setup() {
   printMemoryUsage();
   
   Serial.println(F("\n*** SYSTEM READY ***"));
+  Serial.println(F("*** SSR IS NORMALLY ON ***"));
+  Serial.println(F("*** Will turn OFF only during anomalies ***"));
+  Serial.println(F("*** Auto-calibrates every 2 minutes ***"));
   Serial.println(F("Type commands and press ENTER"));
   Serial.println(F("Try: 'test' to see sensor readings"));
   Serial.println(F("     'reset' to clear errors"));
@@ -358,6 +395,37 @@ void loop() {
     lastSSRVerify = loopStart;
   }
   
+  // Periodic automatic calibration every 2 minutes
+  if (currentState == STATE_MONITORING && 
+      !manualControl && 
+      sensorsValid && 
+      (loopStart - lastCalibrationTime >= CALIBRATION_INTERVAL_MS)) {
+    Serial.println(F("\n⏰ AUTO-CALIBRATION: Starting periodic recalibration..."));
+    Serial.println(F("   (This happens every 2 minutes for accuracy)"));
+    
+    // Save current SSR state
+    ssrStateBeforeCalibration = ssrEnabled;
+    autoCalibrationInProgress = true;
+    
+    // Turn OFF SSR during calibration (requires no load)
+    if (ssrEnabled) {
+      digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+      ssrEnabled = false;
+      Serial.println(F("   SSR temporarily OFF for calibration"));
+    }
+    
+    // Start calibration
+    currentState = STATE_CALIBRATING;
+    calState = CAL_CURRENT_SAMPLING;
+    calProgress.samplesCollected = 0;
+    calProgress.currentSum = 0.0;
+    calProgress.voltageSum = 0.0;
+    calProgress.startTime = millis();
+    lastCalibrationTime = loopStart;
+    
+    return; // Skip rest of loop, start calibrating
+  }
+  
   updateStatusLEDs();
   
   // SD card logging
@@ -367,6 +435,18 @@ void loop() {
              loopStart, voltageReading, currentReading, powerReading, ssrEnabled ? 1 : 0);
     logToSD(logBuffer);
     lastLogUpdate = loopStart;
+  }
+  
+  // WiFi connection check (every 30 seconds)
+  if (loopStart - lastWiFiCheck >= 30000) {
+    checkWiFiConnection();
+    lastWiFiCheck = loopStart;
+  }
+  
+  // Send data to server
+  if (wifiConnected && sensorsValid && (loopStart - lastServerSend >= SERVER_SEND_INTERVAL)) {
+    sendDataToServer();
+    lastServerSend = loopStart;
   }
   
   // Performance tracking
@@ -486,20 +566,53 @@ void autoCalibrateSensorsNonBlocking() {
         Serial.println(F("   System will operate in SAFE MODE (monitoring only)"));
         sensorsValid = false;
         safetyEnabled = true;
+        autoCalibrationInProgress = false;  // Reset flag on failure
+        // MODIFIED: Turn OFF SSR if sensor validation fails
+        ssrEnabled = false;
+        ssrCommandState = false;
+        digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+        Serial.println(F("   SSR turned OFF for safety"));
       } else if (testVoltage < MIN_VALID_VOLTAGE) {
         Serial.println(F("\n⚠️  WARNING: Low voltage detected!"));
         Serial.println(F("   Check voltage sensor connection"));
         Serial.println(F("   Or mains voltage not present"));
         sensorsValid = false;
+        autoCalibrationInProgress = false;  // Reset flag on failure
+        // MODIFIED: Turn OFF SSR if no valid voltage
+        ssrEnabled = false;
+        ssrCommandState = false;
+        digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+        Serial.println(F("   SSR turned OFF for safety"));
       } else {
         Serial.println(F("\n✓ Sensors validated successfully"));
         sensorsValid = true;
         verifyCalibration();
+        
+        // Handle SSR state after calibration
+        if (autoCalibrationInProgress) {
+          // Restore previous SSR state after automatic calibration
+          ssrEnabled = ssrStateBeforeCalibration;
+          ssrCommandState = ssrStateBeforeCalibration;
+          digitalWrite(SSR_CONTROL_PIN, ssrEnabled ? SSR_ON_STATE : SSR_OFF_STATE);
+          Serial.printf("✓ Auto-calibration complete - SSR restored to %s\n", 
+                       ssrEnabled ? "ON" : "OFF");
+          autoCalibrationInProgress = false;
+        } else {
+          // Initial/manual calibration - ensure SSR is ON after successful validation
+          ssrEnabled = true;
+          ssrCommandState = true;
+          digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+          Serial.println(F("✓ SSR is ON - System operational"));
+        }
       }
       
       saveCalibrationData();
       
-      Serial.println(F("\n✓ System ready for operation"));
+      if (autoCalibrationInProgress) {
+        Serial.println(F("✓ Automatic recalibration complete - resuming monitoring"));
+      } else {
+        Serial.println(F("\n✓ System ready for operation"));
+      }
       currentState = STATE_MONITORING;
       calState = CAL_COMPLETE;
       digitalWrite(GREEN_LED_PIN, HIGH);
@@ -792,6 +905,7 @@ void handleBrownout() {
 void triggerSafetyShutdown(const char* reason) {
   Serial.printf("\n🚨 SAFETY SHUTDOWN: %s\n", reason);
   
+  // MODIFIED: Turn OFF SSR during anomaly
   digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
   ssrEnabled = false;
   ssrCommandState = false;
@@ -819,6 +933,7 @@ void triggerSafetyShutdown(const char* reason) {
   }
   
   Serial.println(F("*** SYSTEM IN SAFETY SHUTDOWN ***"));
+  Serial.println(F("*** SSR is OFF due to anomaly ***"));
   Serial.println(F("Type 'reset' to acknowledge and restart"));
 }
 
@@ -904,12 +1019,13 @@ void updateStatusLEDs() {
         digitalWrite(GREEN_LED_PIN, HIGH);
         digitalWrite(RED_LED_PIN, LOW);
       } else {
-        if (millis() - lastBlink > 1000) {
+        // MODIFIED: Blink RED when SSR is OFF (anomaly condition)
+        if (millis() - lastBlink > 500) {
           blinkState = !blinkState;
-          digitalWrite(GREEN_LED_PIN, blinkState);
+          digitalWrite(RED_LED_PIN, blinkState);
           lastBlink = millis();
         }
-        digitalWrite(RED_LED_PIN, LOW);
+        digitalWrite(GREEN_LED_PIN, LOW);
       }
       break;
       
@@ -949,7 +1065,7 @@ void updateDisplay() {
   Serial.println(F("\n========================================"));
   Serial.printf("Status: %s | SSR: %s | Loops: %lu\n", 
                 getStateString().c_str(), 
-                ssrEnabled ? "ON" : "OFF",
+                ssrEnabled ? "ON" : "OFF (ANOMALY)",
                 loopCount);
   Serial.println(F("----------------------------------------"));
   
@@ -994,9 +1110,10 @@ void emergencyReset() {
   currentState = STATE_CALIBRATING;
   calState = CAL_CURRENT_SAMPLING;
   
-  digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-  ssrEnabled = false;
-  ssrCommandState = false;
+  // MODIFIED: Reset to ON state (default behavior)
+  digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+  ssrEnabled = true;
+  ssrCommandState = true;
   
   overcurrentDetected = false;
   overvoltageDetected = false;
@@ -1026,6 +1143,7 @@ void emergencyReset() {
   
   if (calState == CAL_COMPLETE) {
     Serial.println(F("✓ System reset complete"));
+    Serial.println(F("✓ SSR returned to ON state"));
   } else {
     Serial.println(F("⚠️  Reset timeout - manual calibration may be needed"));
   }
@@ -1103,6 +1221,23 @@ void processCommand(const char* command) {
     ESP.restart();
   }
   
+  // MODIFIED: "on" command now just ensures SSR is ON (normal state)
+  else if (strcmp(command, "on") == 0 || strcmp(command, "enable") == 0) {
+    if (isSafeToOperate()) {
+      ssrEnabled = true;
+      ssrCommandState = true;
+      digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+      Serial.println(F("✓ SSR ON - Normal operation restored"));
+    }
+  }
+  // MODIFIED: "off" command now manually turns OFF (override normal behavior)
+  else if (strcmp(command, "off") == 0 || strcmp(command, "disable") == 0) {
+    ssrEnabled = false;
+    ssrCommandState = false;
+    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+    Serial.println(F("✓ SSR MANUALLY DISABLED"));
+    Serial.println(F("   (Use 'on' to restore normal operation)"));
+  }
   else if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
     printMenu();
   }
@@ -1115,20 +1250,6 @@ void processCommand(const char* command) {
   }
   else if (strcmp(command, "mem") == 0 || strcmp(command, "memory") == 0) {
     printMemoryUsage();
-  }
-  else if (strcmp(command, "on") == 0 || strcmp(command, "enable") == 0) {
-    if (isSafeToOperate()) {
-      ssrEnabled = true;
-      ssrCommandState = true;
-      digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
-      Serial.println(F("✓ SSR ENABLED - Load ON"));
-    }
-  }
-  else if (strcmp(command, "off") == 0 || strcmp(command, "disable") == 0) {
-    ssrEnabled = false;
-    ssrCommandState = false;
-    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-    Serial.println(F("✓ SSR DISABLED - Load OFF"));
   }
   else if (strcmp(command, "test") == 0) {
     Serial.println(F("\n=== SENSOR TEST ==="));
@@ -1152,13 +1273,15 @@ void processCommand(const char* command) {
     Serial.println(F("===================\n"));
   }
   else if (strcmp(command, "calibrate") == 0) {
-    Serial.println(F("Starting calibration..."));
+    Serial.println(F("Starting manual calibration..."));
     currentState = STATE_CALIBRATING;
     calState = CAL_CURRENT_SAMPLING;
     calProgress.samplesCollected = 0;
     calProgress.currentSum = 0.0;
     calProgress.voltageSum = 0.0;
     calProgress.startTime = millis();
+    lastCalibrationTime = millis();  // Reset auto-calibration timer
+    autoCalibrationInProgress = false;  // This is manual
   }
   else if (strcmp(command, "cal_voltage") == 0) {
     calibrateVoltageWithReference();
@@ -1236,6 +1359,10 @@ void printMenu() {
   Serial.println(F("\n========================================"));
   Serial.println(F("    COMMAND MENU"));
   Serial.println(F("========================================"));
+  Serial.println(F("NOTE: SSR is NORMALLY ON"));
+  Serial.println(F("      Turns OFF only during anomalies"));
+  Serial.println(F("      Auto-calibrates every 2 minutes"));
+  Serial.println(F("========================================"));
   Serial.println(F("EMERGENCY:"));
   Serial.println(F("  reset         - Emergency reset"));
   Serial.println(F("  restart       - Restart ESP32"));
@@ -1244,7 +1371,8 @@ void printMenu() {
   Serial.println(F("  help          - Show this menu"));
   Serial.println(F("  status        - Show status"));
   Serial.println(F("  test          - Test sensors"));
-  Serial.println(F("  on/off        - Control SSR"));
+  Serial.println(F("  on            - Ensure SSR ON (normal)"));
+  Serial.println(F("  off           - Force SSR OFF (manual)"));
   Serial.println();
   Serial.println(F("DIAGNOSTICS:"));
   Serial.println(F("  diag          - Full diagnostics"));
@@ -1252,7 +1380,8 @@ void printMenu() {
   Serial.println(F("  stats         - Statistics"));
   Serial.println();
   Serial.println(F("CALIBRATION:"));
-  Serial.println(F("  calibrate     - Auto-calibrate"));
+  Serial.println(F("  calibrate     - Manual calibrate now"));
+  Serial.println(F("                  (Auto every 2 min)"));
   Serial.println(F("  cal_voltage   - Voltage wizard"));
   Serial.println(F("  voltage_cal X - Set factor (0.01-1000)"));
   Serial.println(F("  current_cal X - Set factor (0.001-100)"));
@@ -1290,7 +1419,7 @@ void printDiagnostics() {
   Serial.println(F("========================================"));
   
   Serial.println(F("\n--- SYSTEM INFO ---"));
-  Serial.printf("Version: v4.0 Enhanced\n");
+  Serial.printf("Version: v4.0 Enhanced (SSR Normally ON + Auto-Cal)\n");
   Serial.printf("Chip Model: %s\n", ESP.getChipModel());
   Serial.printf("Chip Revision: %d\n", ESP.getChipRevision());
   Serial.printf("CPU Freq: %d MHz\n", ESP.getCpuFreqMHz());
@@ -1314,6 +1443,14 @@ void printDiagnostics() {
   Serial.printf("Power Factor: %.2f\n", calData.powerFactor);
   Serial.printf("EEPROM Valid: %s\n", (calData.magic == EEPROM_MAGIC) ? "YES" : "NO");
   
+  // Show calibration timing
+  unsigned long timeSinceLastCal = (millis() - lastCalibrationTime) / 1000;
+  unsigned long timeUntilNextCal = (CALIBRATION_INTERVAL_MS - (millis() - lastCalibrationTime)) / 1000;
+  if (timeUntilNextCal > 1000000) timeUntilNextCal = 0; // Handle wraparound
+  Serial.printf("Last Calibration: %lu seconds ago\n", timeSinceLastCal);
+  Serial.printf("Next Calibration: in %lu seconds\n", timeUntilNextCal);
+  Serial.printf("Auto-Calibration: Every %d minutes\n", CALIBRATION_INTERVAL_MS / 60000);
+  
   Serial.println(F("\n--- SAFETY STATUS ---"));
   Serial.printf("Safety Enabled: %s\n", safetyEnabled ? "YES" : "NO");
   Serial.printf("Manual Control: %s\n", manualControl ? "YES" : "NO");
@@ -1324,7 +1461,7 @@ void printDiagnostics() {
   Serial.printf("Sensor Fault: %s\n", sensorFaultDetected ? "DETECTED" : "OK");
   
   Serial.println(F("\n--- SSR STATUS ---"));
-  Serial.printf("SSR Enabled: %s\n", ssrEnabled ? "YES" : "NO");
+  Serial.printf("SSR Enabled: %s (Should be ON normally)\n", ssrEnabled ? "YES" : "NO");
   Serial.printf("SSR Command State: %s\n", ssrCommandState ? "ON" : "OFF");
   Serial.printf("SSR Pin State: %s\n", digitalRead(SSR_CONTROL_PIN) == SSR_ON_STATE ? "ON" : "OFF");
   
@@ -1340,7 +1477,18 @@ void printDiagnostics() {
   Serial.println(F("\n--- PERIPHERALS ---"));
   Serial.printf("SD Card: %s\n", sdCardAvailable ? "Available" : "Not Available");
   Serial.printf("Buzzer: %s\n", buzzerEnabled ? "Enabled" : "Disabled");
-  Serial.printf("WiFi: %s\n", wifiEnabled ? "Enabled" : "Disabled");
+  
+  Serial.println(F("\n--- NETWORK ---"));
+  Serial.printf("WiFi Enabled: %s\n", wifiEnabled ? "YES" : "NO");
+  Serial.printf("WiFi Connected: %s\n", wifiConnected ? "YES" : "NO");
+  if (wifiConnected) {
+    Serial.print(F("IP Address: "));
+    Serial.println(WiFi.localIP());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+  }
+  Serial.printf("Server Connected: %s\n", serverConnected ? "YES" : "NO");
+  Serial.printf("Server URL: %s\n", SERVER_URL);
+  Serial.printf("Device ID: %s\n", DEVICE_ID);
   
   Serial.println(F("\n========================================\n"));
 }
@@ -1494,4 +1642,153 @@ void testBuzzer() {
     feedWatchdog();
   }
   Serial.println(F("✓ Buzzer OK"));
+}
+
+// ==================== WIFI FUNCTIONS ====================
+void connectToWiFi() {
+  Serial.print(F("Connecting to WiFi: "));
+  Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  unsigned long startAttempt = millis();
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(F("."));
+    feedWatchdog();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    wifiEnabled = true;
+    Serial.println();
+    Serial.println(F("✓ WiFi connected!"));
+    Serial.print(F("  IP Address: "));
+    Serial.println(WiFi.localIP());
+    Serial.print(F("  Signal: "));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
+    Serial.print(F("  Device ID: "));
+    Serial.println(DEVICE_ID);
+    Serial.print(F("  Server URL: "));
+    Serial.println(SERVER_URL);
+  } else {
+    wifiConnected = false;
+    wifiEnabled = false;
+    Serial.println();
+    Serial.println(F("⚠️  WiFi connection failed!"));
+    Serial.println(F("   System will continue without WiFi"));
+    Serial.println(F("   WiFi reconnection will be attempted periodically"));
+  }
+  
+  Serial.println();
+}
+
+void checkWiFiConnection() {
+  if (!wifiEnabled) return;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiConnected) {
+      Serial.println(F("⚠️  WiFi connection lost! Attempting reconnection..."));
+      wifiConnected = false;
+      serverConnected = false;
+    }
+    
+    WiFi.disconnect();
+    WiFi.reconnect();
+    
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000) {
+      delay(250);
+      feedWatchdog();
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      Serial.println(F("✓ WiFi reconnected!"));
+      Serial.print(F("  IP: "));
+      Serial.println(WiFi.localIP());
+    }
+  } else if (!wifiConnected) {
+    wifiConnected = true;
+    Serial.println(F("✓ WiFi connection restored"));
+  }
+}
+
+// ==================== SERVER COMMUNICATION ====================
+void sendDataToServer() {
+  if (!wifiConnected || !sensorsValid) return;
+  
+  // Create JSON data
+  StaticJsonDocument<512> doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["voltage"] = voltageReading;
+  doc["current"] = currentReading;
+  doc["power"] = powerReading;
+  doc["energy"] = energyConsumed;
+  doc["ssrState"] = ssrEnabled;
+  doc["state"] = getStateString().c_str();
+  doc["sensors"] = sensorsValid ? "valid" : "invalid";
+  
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer);
+  
+  // Send to server
+  bool success = sendHTTPRequest("/api/data", jsonBuffer);
+  
+  if (success && !serverConnected) {
+    serverConnected = true;
+    Serial.println(F("✓ Server connection established"));
+  } else if (!success && serverConnected) {
+    serverConnected = false;
+    Serial.println(F("⚠️  Server connection lost"));
+  }
+}
+
+bool sendHTTPRequest(const char* endpoint, const char* jsonData) {
+  HTTPClient http;
+  
+  // Build full URL
+  String url = String(SERVER_URL) + String(endpoint);
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);  // 5 second timeout
+  
+  int httpResponseCode = http.POST(jsonData);
+  
+  bool success = false;
+  
+  if (httpResponseCode > 0) {
+    if (httpResponseCode == 200) {
+      success = true;
+      
+      // Optional: process response
+      String response = http.getString();
+      
+      // Only log successful connections occasionally to reduce spam
+      static unsigned long lastSuccessLog = 0;
+      if (millis() - lastSuccessLog > 60000) {  // Log once per minute
+        Serial.println(F("✓ Data sent to server"));
+        lastSuccessLog = millis();
+      }
+    } else {
+      static unsigned long lastErrorLog = 0;
+      if (millis() - lastErrorLog > 10000) {  // Log errors every 10 seconds
+        Serial.printf("⚠️  Server error: %d\n", httpResponseCode);
+        lastErrorLog = millis();
+      }
+    }
+  } else {
+    static unsigned long lastFailLog = 0;
+    if (millis() - lastFailLog > 10000) {  // Log failures every 10 seconds
+      Serial.printf("✗ HTTP request failed: %s\n", http.errorToString(httpResponseCode).c_str());
+      lastFailLog = millis();
+    }
+  }
+  
+  http.end();
+  return success;
 }
