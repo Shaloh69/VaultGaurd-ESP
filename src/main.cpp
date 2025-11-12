@@ -1,35 +1,35 @@
 /*
- * Vaulter - ENHANCED VERSION v4.0
+ * Vaulter v5.3 - PHILIPPINES FIXED VERSION - VOLTAGE CORRECTED
+ * Server: https://meifhi-esp-server.onrender.com
+ * Features: PIR Child Safety, Auto-Calibration, Self-Reliance, WebSocket Connectivity
  * 
- * MAJOR IMPROVEMENTS:
- * - Non-blocking architecture with state machine
- * - EEPROM CRC validation
- * - Optimized RMS calculation timing
- * - Memory-efficient char buffers (no String in loops)
- * - Serial input protection
- * - Better error handling and recovery
- * - SSR state verification
- * - Brown-out detection
- * - Performance metrics
- * - Comprehensive diagnostics
- * - Safer watchdog handling
- * - Graceful degradation on sensor failure
+ * PHILIPPINES ELECTRICAL STANDARDS:
+ * - Voltage: 220V nominal (210-230V range)
+ * - Frequency: 60Hz
+ * - CRITICAL FIX: Corrected ZMPT101B sensitivity and calibration limits
  * 
- * MODIFIED: 
- * - SSR is ALWAYS ON by default, turns OFF only during anomalies
- * - Automatic periodic calibration every 2 minutes
+ * VERSION 5.3 FIXES:
+ * - CRITICAL: Fixed ZMPT101B sensitivity from 0.0053 to 0.004 (correct for standard module)
+ * - CRITICAL: Added maximum calibration factor limits (max 10.0 instead of unlimited)
+ * - CRITICAL: Added voltage reading sanity checks to prevent 20kV errors
+ * - CRITICAL: Reset default voltage calibration to 1.0 for safety
+ * - Improved calibration validation with stricter checks
+ * - Added real-time voltage validation during operation
+ * - All PIR improvements from v5.2 preserved
+ * - Enhanced error reporting for voltage issues
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 #include <esp_task_wdt.h>
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <WebSocketsClient.h>
 
-// ==================== PIN DEFINITIONS ====================
 #define ACS712_PIN          34
 #define ZMPT101B_PIN        35
 #define SSR_CONTROL_PIN     5
@@ -39,62 +39,93 @@
 #define PIR_SENSOR_PIN      18
 #define SD_CS_PIN           15
 
-// ==================== WIFI & SERVER CONFIGURATION ====================
-// **IMPORTANT: Change these to match your network and server!**
-#define WIFI_SSID           "YOUR_WIFI_SSID"        // Change this!
-#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"    // Change this!
-#define SERVER_URL          "http://192.168.1.100:3000"  // Change this to your server IP!
-#define DEVICE_ID           "ESP32_001"             // Unique ID for this device
-#define WIFI_TIMEOUT_MS     20000                   // WiFi connection timeout
-#define SERVER_SEND_INTERVAL 5000                   // Send data every 5 seconds
+#define WIFI_SSID           "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+#define SERVER_HOST         "meifhi-esp-server.onrender.com"
+#define SERVER_PORT         443
+#define SERVER_ENDPOINT     "/api/data"
+#define WS_PATH             "/ws"
+#define DEVICE_ID           "VAULTER_001"
+#define DEVICE_TYPE         "VAULTER"
+#define WIFI_TIMEOUT_MS     20000
+#define SERVER_SEND_INTERVAL 5000
+#define SERVER_TIMEOUT      10000
+#define MAX_RETRY_ATTEMPTS  3
 
-// ==================== ADC CONFIGURATION ====================
 #define ADC_RESOLUTION      4096.0
-#define ADC_VREF            3.6
-#define ADC_SAMPLES_FAST    2      // Fast sampling for RMS
-#define ADC_SAMPLES_SLOW    12     // Accurate sampling for calibration
+#define ADC_VREF            3.3
+#define ADC_SAMPLES_FAST    2
+#define ADC_SAMPLES_SLOW    12
 
-// ==================== ACS712-05B CONFIGURATION ====================
-#define ACS712_SENSITIVITY  0.185
-#define ACS712_ZERO_CURRENT 2.5
+// ACS712 Current Sensor (5A version)
+#define ACS712_SENSITIVITY  0.185        // 185mV per Ampere for 5A version
+#define ACS712_ZERO_CURRENT 2.5          // Zero current at 2.5V
 #define ACS712_SUPPLY_VOLTAGE 5.0
-#define VOLTAGE_DIVIDER_RATIO 0.667
+#define VOLTAGE_DIVIDER_RATIO 0.667      // 3.3V ADC / 5V sensor
 #define VOLTAGE_DIVIDER_SCALE 1.5
 #define EXPECTED_OFFSET_MIN 1.35
 #define EXPECTED_OFFSET_MAX 1.95
 #define MAX_VALID_CURRENT   6.0
 
-// ==================== ZMPT101B CONFIGURATION ====================
-#define ZMPT101B_SENSITIVITY 0.0125
-#define AC_FREQUENCY        50
-#define AC_PERIOD_MS        20
+// ZMPT101B Voltage Sensor - CORRECTED FOR PHILIPPINES v5.3
+// Standard ZMPT101B module specifications:
+// - Transformer ratio: 1000:1 typically
+// - For 220V RMS input, output is ~0.88V RMS centered at VCC/2 (1.65V)
+// - Sensitivity calculation: 0.88V / 220V = 0.004 V/V (4mV per volt)
+// CRITICAL FIX: Changed from 0.0053 to 0.004 (correct for standard ZMPT101B)
+#define ZMPT101B_SENSITIVITY 0.004       // FIXED: 4mV per volt (was 0.0053)
+#define AC_FREQUENCY        60           // Philippines uses 60Hz
+#define AC_PERIOD_MS        16.67        // 1000ms/60Hz = 16.67ms
 #define RMS_SAMPLES         100
-#define RMS_SAMPLE_DELAY_US 150    // Optimized for faster sampling
+#define RMS_SAMPLE_DELAY_US 150
 #define MIN_AC_SWING        0.1
 #define MIN_VALID_VOLTAGE   50.0
 
-// ==================== SSR CONTROL CONFIGURATION ====================
-#define SSR_ON_STATE        LOW
-#define SSR_OFF_STATE       HIGH
-#define SSR_VERIFY_INTERVAL 5000   // Verify SSR state every 5s
-
-// ==================== SAFETY THRESHOLDS ====================
-#define MAX_CURRENT         4.5
-#define MAX_VOLTAGE         250.0
-#define MIN_VOLTAGE         200.0
-#define SENSOR_FAULT_VOLTAGE 350.0
+// Philippines Voltage Standards
+#define NOMINAL_VOLTAGE     220.0        // Philippines nominal voltage
+#define MAX_VOLTAGE         240.0        // Upper safe limit for Philippines
+#define MIN_VOLTAGE         200.0        // Lower safe limit for Philippines
+#define SENSOR_FAULT_VOLTAGE 280.0       // Fault detection threshold
+#define BROWNOUT_VOLTAGE    180.0        // Brownout threshold
 #define MAX_SENSOR_CURRENT  20.0
 #define OVERCURRENT_TIME    1000
 #define OVERVOLTAGE_TIME    500
 #define SAFETY_DEBOUNCE_COUNT 5
-#define BROWNOUT_VOLTAGE    180.0
 #define BROWNOUT_TIME       2000
 
-// ==================== SYSTEM CONFIGURATION ====================
+// CRITICAL: Calibration safety limits (v5.3)
+#define MAX_VOLTAGE_CALIBRATION 10.0     // NEW: Prevent extreme calibration values
+#define MIN_VOLTAGE_CALIBRATION 0.1      // NEW: Prevent division by near-zero
+#define MAX_CURRENT_CALIBRATION 10.0     // NEW: Prevent extreme calibration values
+#define MIN_CURRENT_CALIBRATION 0.1      // NEW: Prevent division by near-zero
+
+// PIR SETTINGS - OPTIMIZED FOR FASTER RESPONSE AND STABLE OPERATION
+#define PIR_ENABLED         true
+#define PIR_MOTION_TIMEOUT  10000        // Time to wait after motion detected
+#define PIR_NO_MOTION_TIME  3000         // Faster recovery when no load
+#define PIR_CHECK_INTERVAL  50           // Check every 50ms for faster response
+#define PIR_DEBOUNCE_TIME   100          // Faster debouncing
+#define LOAD_DETECTION_THRESHOLD 0.08    // Slightly lower threshold for better detection
+#define LOAD_STABLE_TIME    500          // Faster load detection
+#define LOAD_LOST_TIME      1000         // Time to confirm load is actually lost
+#define PIR_ALERT_BEEPS     2
+
+#define SSR_ON_STATE        LOW
+#define SSR_OFF_STATE       HIGH
+#define SSR_VERIFY_INTERVAL 5000
+
+#define MAX_CURRENT         4.5
+
+#define AUTO_RECOVERY_ENABLED true
+#define MAX_AUTO_RECOVERY_ATTEMPTS 3
+#define RECOVERY_DELAY_MS   5000
+#define SENSOR_FAULT_RECOVERY_TIME 30000
+#define CRITICAL_ERROR_RESTART_TIME 300000
+
 #define SAMPLE_RATE         1000
 #define DISPLAY_INTERVAL    2000
 #define CALIBRATION_SAMPLES 500
-#define CALIBRATION_INTERVAL_MS 120000  // Auto-calibrate every 2 minutes
+#define CALIBRATION_INTERVAL_MS 120000
 #define MOVING_AVERAGE_SIZE 10
 #define WATCHDOG_TIMEOUT_S  30
 #define LOG_INTERVAL_MS     5000
@@ -102,39 +133,21 @@
 #define SERIAL_RX_BUFFER    256
 #define EEPROM_SIZE         512
 #define EEPROM_MAGIC        0xDEADBEEF
-
-// ==================== POWER FACTOR ====================
 #define DEFAULT_POWER_FACTOR 0.95
-
-// ==================== PERFORMANCE TRACKING ====================
 #define PERF_SAMPLES        100
 
-// ==================== SYSTEM STATES ====================
-enum SystemState {
-  STATE_INITIALIZING,
-  STATE_CALIBRATING,
-  STATE_MONITORING,
-  STATE_MANUAL_CONTROL,
-  STATE_ERROR,
-  STATE_SHUTDOWN
-};
+enum SystemState {STATE_INITIALIZING, STATE_CALIBRATING, STATE_MONITORING, STATE_MANUAL_CONTROL, STATE_ERROR, STATE_RECOVERY, STATE_SHUTDOWN};
+enum CalibrationState {CAL_IDLE, CAL_CURRENT_SAMPLING, CAL_VOLTAGE_SAMPLING, CAL_VERIFICATION, CAL_COMPLETE};
+enum PIRState {PIR_INACTIVE, PIR_MONITORING, PIR_MOTION_DETECTED, PIR_COOLDOWN};
 
-// ==================== CALIBRATION STATES ====================
-enum CalibrationState {
-  CAL_IDLE,
-  CAL_CURRENT_SAMPLING,
-  CAL_VOLTAGE_SAMPLING,
-  CAL_VERIFICATION,
-  CAL_COMPLETE
-};
-
-// ==================== GLOBAL VARIABLES ====================
 SystemState currentState = STATE_INITIALIZING;
 CalibrationState calState = CAL_IDLE;
-bool ssrEnabled = true;  // MODIFIED: Start with SSR ON
-bool ssrCommandState = true;  // MODIFIED: Command state also ON
-bool ssrStateBeforeCalibration = false;  // Track SSR state before auto-calibration
-bool autoCalibrationInProgress = false;  // Flag for automatic periodic calibration
+PIRState pirState = PIR_INACTIVE;
+
+bool ssrEnabled = true;
+bool ssrCommandState = true;
+bool ssrStateBeforeCalibration = false;
+bool autoCalibrationInProgress = false;
 bool manualControl = false;
 bool safetyEnabled = true;
 bool buzzerEnabled = true;
@@ -142,10 +155,29 @@ bool sdCardAvailable = false;
 bool wifiEnabled = false;
 bool wifiConnected = false;
 bool serverConnected = false;
+bool wsConnected = false;
 bool sensorsValid = false;
 bool criticalError = false;
 
-// ==================== SENSOR DATA ====================
+bool pirEnabled = PIR_ENABLED;
+bool pirMotionDetected = false;
+bool loadDetected = false;
+bool pirManualOverride = false;
+unsigned long lastMotionTime = 0;
+unsigned long lastNoMotionTime = 0;
+unsigned long lastPirCheck = 0;
+unsigned long lastPirChange = 0;
+unsigned long loadDetectedTime = 0;
+unsigned long loadLostTime = 0;
+int pirTriggerCount = 0;
+int pirFalseAlarmCount = 0;
+
+int autoRecoveryAttempts = 0;
+unsigned long lastRecoveryAttempt = 0;
+unsigned long sensorFaultStartTime = 0;
+unsigned long criticalErrorStartTime = 0;
+bool autoRecoveryMode = false;
+
 float currentReading = 0.0;
 float voltageReading = 0.0;
 float powerReading = 0.0;
@@ -153,7 +185,6 @@ float apparentPower = 0.0;
 float energyConsumed = 0.0;
 float powerFactor = DEFAULT_POWER_FACTOR;
 
-// ==================== CALIBRATION VALUES ====================
 struct CalibrationData {
   uint32_t magic;
   float currentOffset;
@@ -164,17 +195,17 @@ struct CalibrationData {
   uint32_t crc;
 };
 
+// CRITICAL: Reset voltage calibration to 1.0 for safety (v5.3)
 CalibrationData calData = {
   .magic = EEPROM_MAGIC,
   .currentOffset = ACS712_ZERO_CURRENT * VOLTAGE_DIVIDER_RATIO,
   .voltageOffset = 1.65,
   .currentCalibration = 1.0,
-  .voltageCalibration = 1.0,
+  .voltageCalibration = 1.0,  // RESET: Was potentially corrupted causing 20kV readings
   .powerFactor = DEFAULT_POWER_FACTOR,
   .crc = 0
 };
 
-// ==================== SAFETY MONITORING ====================
 unsigned long overcurrentStartTime = 0;
 unsigned long overvoltageStartTime = 0;
 unsigned long brownoutStartTime = 0;
@@ -183,17 +214,14 @@ bool overvoltageDetected = false;
 bool undervoltageDetected = false;
 bool brownoutDetected = false;
 bool sensorFaultDetected = false;
-
 int overcurrentDebounceCount = 0;
 int overvoltageDebounceCount = 0;
 int sensorFaultDebounceCount = 0;
 
-// ==================== MOVING AVERAGE BUFFERS ====================
 float currentBuffer[MOVING_AVERAGE_SIZE];
 float voltageBuffer[MOVING_AVERAGE_SIZE];
 int bufferIndex = 0;
 
-// ==================== TIMING VARIABLES ====================
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastEnergyUpdate = 0;
 unsigned long lastLogUpdate = 0;
@@ -201,12 +229,12 @@ unsigned long lastSSRVerify = 0;
 unsigned long lastCalibrationTime = 0;
 unsigned long lastServerSend = 0;
 unsigned long lastWiFiCheck = 0;
+unsigned long lastWSReconnect = 0;
 unsigned long systemStartTime = 0;
 unsigned long lastWatchdogFeed = 0;
 unsigned long lastSampleTime = 0;
 unsigned long lastLoopTime = 0;
 
-// ==================== STATISTICS ====================
 unsigned long totalOperatingTime = 0;
 float maxCurrent = 0.0;
 float maxVoltage = 0.0;
@@ -214,8 +242,10 @@ float minVoltage = 999.0;
 float maxPower = 0.0;
 unsigned long shutdownCount = 0;
 unsigned long loopCount = 0;
+int serverErrorCount = 0;
+int serverSuccessCount = 0;
+int voltageErrorCount = 0;  // NEW: Track voltage reading errors
 
-// ==================== PERFORMANCE METRICS ====================
 struct PerformanceMetrics {
   unsigned long avgLoopTime;
   unsigned long maxLoopTime;
@@ -225,7 +255,6 @@ struct PerformanceMetrics {
 };
 PerformanceMetrics perfMetrics = {0, 0, 999999, 0, 0};
 
-// ==================== CALIBRATION PROGRESS ====================
 struct CalibrationProgress {
   int samplesCollected;
   float currentSum;
@@ -234,7 +263,9 @@ struct CalibrationProgress {
 };
 CalibrationProgress calProgress = {0, 0.0, 0.0, 0};
 
-// ==================== FUNCTION PROTOTYPES ====================
+WiFiClientSecure secureClient;
+WebSocketsClient webSocket;
+
 void startupSequence();
 void autoCalibrateSensorsNonBlocking();
 void calibrateVoltageWithReference();
@@ -251,6 +282,7 @@ void updateStatistics();
 void updateStatusLEDs();
 void updateDisplay();
 String getStateString();
+String getPIRStateString();
 void handleSerialCommands();
 void processCommand(const char* command);
 void printMenu();
@@ -276,19 +308,44 @@ void handleBrownout();
 void connectToWiFi();
 void checkWiFiConnection();
 void sendDataToServer();
-bool sendHTTPRequest(const char* endpoint, const char* jsonData);
+void initWebSocket();
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
+void initPIRSensor();
+void updatePIRChildSafety();
+bool checkLoadPluggedIn();
+void handlePIRMotion();
+void handlePIRNoMotion();
+void enablePIR();
+void disablePIR();
+void pirAlert();
+void printPIRStatus();
+void attemptAutoRecovery();
+void recoverFromSensorFault();
+void handleCriticalError();
+bool performSelfDiagnostic();
+void resetErrorCounters();
+void validateCalibrationData();  // NEW: Validate calibration before use
 
-// ==================== SETUP FUNCTION ====================
 void setup() {
   Serial.begin(115200);
   Serial.setRxBufferSize(SERIAL_RX_BUFFER);
   delay(2000);
   
   Serial.println(F("\n========================================"));
-  Serial.println(F("ESP32 Electrical Safety Monitor"));
-  Serial.println(F("ENHANCED VERSION v4.0"));
-  Serial.println(F("MODIFIED: SSR NORMALLY ON"));
-  Serial.println(F("AUTO-CALIBRATION: Every 2 Minutes"));
+  Serial.println(F("ESP32 Vaulter v5.3 - VOLTAGE FIXED"));
+  Serial.println(F("Server: meifhi-esp-server.onrender.com"));
+  Serial.println(F("========================================"));
+  Serial.println(F("PHILIPPINES ELECTRICAL STANDARDS:"));
+  Serial.printf("Nominal Voltage: %.0fV\n", NOMINAL_VOLTAGE);
+  Serial.printf("Frequency: %dHz\n", AC_FREQUENCY);
+  Serial.printf("Voltage Range: %.0f-%.0fV\n", MIN_VOLTAGE, MAX_VOLTAGE);
+  Serial.println(F("========================================"));
+  Serial.println(F("VERSION 5.3 CRITICAL FIXES:"));
+  Serial.println(F("✓ ZMPT101B sensitivity: 0.0053 → 0.004"));
+  Serial.println(F("✓ Added calibration limits (max 10.0x)"));
+  Serial.println(F("✓ Real-time voltage validation"));
+  Serial.println(F("✓ Voltage calibration reset to 1.0"));
+  Serial.println(F("✓ All PIR improvements preserved"));
   Serial.println(F("========================================"));
   
   EEPROM.begin(EEPROM_SIZE);
@@ -299,7 +356,6 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIR_SENSOR_PIN, INPUT);
   
-  // MODIFIED: Start with SSR ON instead of OFF
   digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
@@ -315,17 +371,24 @@ void setup() {
   
   setupWatchdog();
   initSDCard();
+  initPIRSensor();
   
-  // Initialize WiFi connection
   Serial.println(F("\n=== WIFI INITIALIZATION ==="));
   connectToWiFi();
   
+  if (wifiConnected) {
+    initWebSocket();
+  }
+  
   if (!loadCalibrationData()) {
-    Serial.println(F("⚠️  Using default calibration values"));
+    Serial.println(F("Using default calibration"));
+  } else {
+    // NEW: Validate loaded calibration data
+    validateCalibrationData();
   }
   
   systemStartTime = millis();
-  lastCalibrationTime = millis();  // Initialize for periodic calibration
+  lastCalibrationTime = millis();
   currentState = STATE_CALIBRATING;
   calState = CAL_IDLE;
   
@@ -334,34 +397,40 @@ void setup() {
   printMemoryUsage();
   
   Serial.println(F("\n*** SYSTEM READY ***"));
-  Serial.println(F("*** SSR IS NORMALLY ON ***"));
-  Serial.println(F("*** Will turn OFF only during anomalies ***"));
-  Serial.println(F("*** Auto-calibrates every 2 minutes ***"));
-  Serial.println(F("Type commands and press ENTER"));
-  Serial.println(F("Try: 'test' to see sensor readings"));
-  Serial.println(F("     'reset' to clear errors"));
-  Serial.println(F("     'help' for all commands\n"));
+  Serial.printf("*** Server: %s ***\n", SERVER_HOST);
+  Serial.println(F("Type 'help' for commands\n"));
 }
 
-// ==================== MAIN LOOP (NON-BLOCKING) ====================
 void loop() {
   unsigned long loopStart = millis();
   
-  // Prevent loop from running too fast
-  if (loopStart - lastLoopTime < 10) {
-    return;
-  }
+  if (loopStart - lastLoopTime < 10) return;
   
   feedWatchdog();
   handleSerialCommands();
   
-  // Non-blocking calibration
+  if (wifiConnected && wsConnected) {
+    webSocket.loop();
+  }
+  
+  if (currentState == STATE_RECOVERY) {
+    attemptAutoRecovery();
+    return;
+  }
+  
+  if (currentState == STATE_ERROR && criticalError && AUTO_RECOVERY_ENABLED) {
+    handleCriticalError();
+  }
+  
   if (currentState == STATE_CALIBRATING && calState != CAL_COMPLETE) {
     autoCalibrateSensorsNonBlocking();
     return;
   }
   
-  // Sensor reading at controlled rate
+  if (sensorsValid && pirEnabled && !manualControl && currentState != STATE_ERROR) {
+    updatePIRChildSafety();
+  }
+  
   if (sensorsValid && (loopStart - lastSampleTime >= SAMPLE_RATE)) {
     readSensors();
     updateMovingAverages();
@@ -370,398 +439,416 @@ void loop() {
     if (!validateSensorReadings()) {
       sensorFaultDebounceCount++;
       if (sensorFaultDebounceCount >= SAFETY_DEBOUNCE_COUNT && !sensorFaultDetected) {
-        triggerSafetyShutdown("SENSOR_FAULT");
+        sensorFaultDetected = true;
+        sensorFaultStartTime = loopStart;
+        
+        if (AUTO_RECOVERY_ENABLED) {
+          Serial.println(F("Sensor fault - initiating recovery"));
+          currentState = STATE_RECOVERY;
+        } else {
+          triggerSafetyShutdown("SENSOR_FAULT");
+        }
       }
     } else {
       sensorFaultDebounceCount = 0;
+      if (sensorFaultDetected) {
+        sensorFaultDetected = false;
+        sensorFaultStartTime = 0;
+        Serial.println(F("Sensor fault cleared"));
+        resetErrorCounters();
+      }
     }
     
-    if (safetyEnabled && !manualControl && currentState != STATE_ERROR) {
+    if (safetyEnabled && !manualControl && currentState != STATE_ERROR && pirState != PIR_MOTION_DETECTED) {
       performSafetyChecks();
     }
     
     updateEnergyCalculation();
   }
   
-  // Display update
   if (loopStart - lastDisplayUpdate >= DISPLAY_INTERVAL) {
     updateDisplay();
+    updateStatusLEDs();
     lastDisplayUpdate = loopStart;
   }
   
-  // SSR state verification
   if (loopStart - lastSSRVerify >= SSR_VERIFY_INTERVAL) {
     verifySSRState();
     lastSSRVerify = loopStart;
   }
   
-  // Periodic automatic calibration every 2 minutes
-  if (currentState == STATE_MONITORING && 
-      !manualControl && 
-      sensorsValid && 
-      (loopStart - lastCalibrationTime >= CALIBRATION_INTERVAL_MS)) {
-    Serial.println(F("\n⏰ AUTO-CALIBRATION: Starting periodic recalibration..."));
-    Serial.println(F("   (This happens every 2 minutes for accuracy)"));
-    
-    // Save current SSR state
-    ssrStateBeforeCalibration = ssrEnabled;
-    autoCalibrationInProgress = true;
-    
-    // Turn OFF SSR during calibration (requires no load)
-    if (ssrEnabled) {
-      digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-      ssrEnabled = false;
-      Serial.println(F("   SSR temporarily OFF for calibration"));
-    }
-    
-    // Start calibration
-    currentState = STATE_CALIBRATING;
-    calState = CAL_CURRENT_SAMPLING;
-    calProgress.samplesCollected = 0;
-    calProgress.currentSum = 0.0;
-    calProgress.voltageSum = 0.0;
-    calProgress.startTime = millis();
-    lastCalibrationTime = loopStart;
-    
-    return; // Skip rest of loop, start calibrating
-  }
-  
-  updateStatusLEDs();
-  
-  // SD card logging
-  if (sdCardAvailable && sensorsValid && (loopStart - lastLogUpdate >= LOG_INTERVAL_MS)) {
-    char logBuffer[128];
-    snprintf(logBuffer, sizeof(logBuffer), "%lu,%.2f,%.3f,%.2f,%d",
-             loopStart, voltageReading, currentReading, powerReading, ssrEnabled ? 1 : 0);
-    logToSD(logBuffer);
-    lastLogUpdate = loopStart;
-  }
-  
-  // WiFi connection check (every 30 seconds)
   if (loopStart - lastWiFiCheck >= 30000) {
     checkWiFiConnection();
     lastWiFiCheck = loopStart;
+    
+    if (wifiConnected && !wsConnected && (loopStart - lastWSReconnect > 30000)) {
+      Serial.println(F("Reconnecting WebSocket..."));
+      initWebSocket();
+      lastWSReconnect = loopStart;
+    }
   }
   
-  // Send data to server
-  if (wifiConnected && sensorsValid && (loopStart - lastServerSend >= SERVER_SEND_INTERVAL)) {
+  if (sensorsValid && wifiConnected && (loopStart - lastServerSend >= SERVER_SEND_INTERVAL)) {
     sendDataToServer();
     lastServerSend = loopStart;
   }
   
-  // Performance tracking
+  if (loopStart - lastLogUpdate >= LOG_INTERVAL_MS) {
+    if (sdCardAvailable && sensorsValid) {
+      char logBuffer[128];
+      snprintf(logBuffer, sizeof(logBuffer), "%lu,%.1f,%.3f,%.1f,%d,%d,%d,%s",
+               loopStart, voltageReading, currentReading, powerReading,
+               ssrEnabled, pirEnabled, loadDetected, getStateString().c_str());
+      logToSD(logBuffer);
+    }
+    lastLogUpdate = loopStart;
+  }
+  
   unsigned long loopTime = millis() - loopStart;
   updatePerformanceMetrics(loopTime);
-  
   lastLoopTime = loopStart;
   loopCount++;
 }
 
-// ==================== WATCHDOG TIMER ====================
-void setupWatchdog() {
-  Serial.println(F("Setting up watchdog timer..."));
-  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
-  esp_task_wdt_add(NULL);
-  Serial.printf("Watchdog enabled with %d second timeout\n", WATCHDOG_TIMEOUT_S);
-}
-
-void feedWatchdog() {
-  if (millis() - lastWatchdogFeed > 1000) {
-    esp_task_wdt_reset();
-    lastWatchdogFeed = millis();
-  }
-}
-
-// ==================== STARTUP SEQUENCE ====================
 void startupSequence() {
-  Serial.println(F("\n=== SYSTEM INITIALIZATION ==="));
+  Serial.println(F("\n=== STARTUP SEQUENCE ==="));
   
-  Serial.println(F("Testing LEDs..."));
+  Serial.print(F("Testing RED LED... "));
   digitalWrite(RED_LED_PIN, HIGH);
-  delay(250);
+  delay(300);
   digitalWrite(RED_LED_PIN, LOW);
+  Serial.println(F("OK"));
+  
+  Serial.print(F("Testing GREEN LED... "));
   digitalWrite(GREEN_LED_PIN, HIGH);
-  delay(250);
+  delay(300);
   digitalWrite(GREEN_LED_PIN, LOW);
+  Serial.println(F("OK"));
+  
+  Serial.print(F("Testing SSR... "));
+  digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+  delay(300);
+  digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+  Serial.println(F("OK"));
   
   if (buzzerEnabled) {
-    Serial.println(F("Testing buzzer..."));
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-    delay(100);
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
+    Serial.print(F("Testing BUZZER... "));
+    testBuzzer();
+    Serial.println(F("OK"));
   }
   
-  Serial.println(F("✓ Hardware test complete"));
-  
-  Serial.println(F("\n=== AUTO-CALIBRATING SENSORS ==="));
-  Serial.println(F("IMPORTANT: Ensure NO LOAD connected!"));
-  Serial.println(F("Calibration will proceed automatically..."));
-  
-  calState = CAL_CURRENT_SAMPLING;
-  calProgress.samplesCollected = 0;
-  calProgress.currentSum = 0.0;
-  calProgress.voltageSum = 0.0;
-  calProgress.startTime = millis();
+  Serial.println(F("========================\n"));
 }
 
-// ==================== NON-BLOCKING AUTO CALIBRATION ====================
 void autoCalibrateSensorsNonBlocking() {
+  static unsigned long phaseStartTime = 0;
   unsigned long now = millis();
   
   switch (calState) {
+    case CAL_IDLE:
+      Serial.println(F("\n=== AUTO CALIBRATION ==="));
+      Serial.println(F("Ensure NO LOAD connected"));
+      Serial.println(F("[1/4] Sampling current offset..."));
+      
+      calProgress.samplesCollected = 0;
+      calProgress.currentSum = 0.0;
+      calProgress.startTime = now;
+      phaseStartTime = now;
+      calState = CAL_CURRENT_SAMPLING;
+      break;
+      
     case CAL_CURRENT_SAMPLING:
-    case CAL_VOLTAGE_SAMPLING:
       if (calProgress.samplesCollected < CALIBRATION_SAMPLES) {
-        float currentVoltage = readRawSensorVoltage(ACS712_PIN, ADC_SAMPLES_SLOW);
-        float voltageVoltage = readRawSensorVoltage(ZMPT101B_PIN, ADC_SAMPLES_SLOW);
-        
-        calProgress.currentSum += currentVoltage;
-        calProgress.voltageSum += voltageVoltage;
+        float rawCurrent = readRawSensorVoltage(ACS712_PIN, ADC_SAMPLES_SLOW);
+        calProgress.currentSum += rawCurrent;
         calProgress.samplesCollected++;
         
-        if (calProgress.samplesCollected % 50 == 0) {
-          Serial.print(F("."));
+        if (calProgress.samplesCollected % 100 == 0) {
+          Serial.printf("[1/4] Current: %d/%d samples\n", 
+                       calProgress.samplesCollected, CALIBRATION_SAMPLES);
           feedWatchdog();
         }
       } else {
-        Serial.println();
         calData.currentOffset = calProgress.currentSum / CALIBRATION_SAMPLES;
-        calData.voltageOffset = calProgress.voltageSum / CALIBRATION_SAMPLES;
+        Serial.printf("[1/4] Current offset: %.3fV\n", calData.currentOffset);
         
-        Serial.printf("\nCalibration Results:\n");
-        Serial.printf("  Current offset: %.3f V ", calData.currentOffset);
-        
-        float expectedOffset = ACS712_ZERO_CURRENT * VOLTAGE_DIVIDER_RATIO;
-        if (calData.currentOffset >= EXPECTED_OFFSET_MIN && calData.currentOffset <= EXPECTED_OFFSET_MAX) {
-          Serial.println(F("✓ OK"));
-        } else {
-          Serial.printf("⚠️  WARNING (expected ~%.2fV)\n", expectedOffset);
-          Serial.println(F("     Check ACS712 connection and voltage divider"));
+        if (calData.currentOffset < EXPECTED_OFFSET_MIN || calData.currentOffset > EXPECTED_OFFSET_MAX) {
+          Serial.println(F("WARNING: Current offset out of expected range (1.35-1.95V)"));
+          Serial.println(F("This may indicate ACS712 sensor issue"));
         }
         
-        Serial.printf("  Voltage offset: %.3f V ✓\n", calData.voltageOffset);
-        
-        calState = CAL_VERIFICATION;
         calProgress.samplesCollected = 0;
+        calProgress.voltageSum = 0.0;
+        phaseStartTime = now;
+        calState = CAL_VOLTAGE_SAMPLING;
+      }
+      break;
+      
+    case CAL_VOLTAGE_SAMPLING:
+      if (calProgress.samplesCollected < CALIBRATION_SAMPLES) {
+        float rawVoltage = readRawSensorVoltage(ZMPT101B_PIN, ADC_SAMPLES_SLOW);
+        calProgress.voltageSum += rawVoltage;
+        calProgress.samplesCollected++;
+        
+        if (calProgress.samplesCollected % 100 == 0) {
+          Serial.printf("[2/4] Voltage: %d/%d samples\n", 
+                       calProgress.samplesCollected, CALIBRATION_SAMPLES);
+          feedWatchdog();
+        }
+      } else {
+        calData.voltageOffset = calProgress.voltageSum / CALIBRATION_SAMPLES;
+        Serial.printf("[2/4] Voltage offset: %.3fV\n", calData.voltageOffset);
+        
+        if (calData.voltageOffset < 1.5 || calData.voltageOffset > 1.8) {
+          Serial.println(F("WARNING: Voltage offset out of expected range (1.5-1.8V)"));
+        }
+        
+        phaseStartTime = now;
+        calState = CAL_VERIFICATION;
       }
       break;
       
     case CAL_VERIFICATION:
-      Serial.println(F("\n=== VALIDATING SENSORS ==="));
+      Serial.println(F("[3/4] Verifying calibration..."));
       
-      float testCurrent = calculateRMSCurrent();
-      float testVoltage = calculateRMSVoltage(ZMPT101B_PIN);
+      readSensors();
       
-      Serial.printf("Test readings:\n");
-      Serial.printf("  Current: %.3f A\n", testCurrent);
-      Serial.printf("  Voltage: %.1f V\n", testVoltage);
+      Serial.printf("Initial readings:\n");
+      Serial.printf("  Current: %.3f A\n", currentReading);
+      Serial.printf("  Voltage: %.1f V\n", voltageReading);
       
-      if (testCurrent > 1.0) {
-        Serial.println(F("\n⚠️  WARNING: High current detected with no load!"));
-        Serial.println(F("   Current sensor may be faulty or incorrectly connected"));
-        Serial.println(F("   System will operate in SAFE MODE (monitoring only)"));
-        sensorsValid = false;
-        safetyEnabled = true;
-        autoCalibrationInProgress = false;  // Reset flag on failure
-        // MODIFIED: Turn OFF SSR if sensor validation fails
-        ssrEnabled = false;
-        ssrCommandState = false;
-        digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-        Serial.println(F("   SSR turned OFF for safety"));
-      } else if (testVoltage < MIN_VALID_VOLTAGE) {
-        Serial.println(F("\n⚠️  WARNING: Low voltage detected!"));
-        Serial.println(F("   Check voltage sensor connection"));
-        Serial.println(F("   Or mains voltage not present"));
-        sensorsValid = false;
-        autoCalibrationInProgress = false;  // Reset flag on failure
-        // MODIFIED: Turn OFF SSR if no valid voltage
-        ssrEnabled = false;
-        ssrCommandState = false;
-        digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-        Serial.println(F("   SSR turned OFF for safety"));
+      if (currentReading > 0.5) {
+        Serial.println(F("ERROR: Load detected during calibration!"));
+        Serial.println(F("Please disconnect load and restart calibration"));
+        calState = CAL_IDLE;
+      } else if (voltageReading < MIN_VALID_VOLTAGE || voltageReading > SENSOR_FAULT_VOLTAGE) {
+        Serial.println(F("ERROR: Invalid voltage reading!"));
+        Serial.printf("  Read: %.1fV (Expected: %.0f-%.0fV)\n", 
+                     voltageReading, MIN_VALID_VOLTAGE, MAX_VOLTAGE);
+        Serial.println(F("  Resetting voltage calibration to 1.0"));
+        calData.voltageCalibration = 1.0;  // NEW: Reset if verification fails
+        calState = CAL_IDLE;
       } else {
-        Serial.println(F("\n✓ Sensors validated successfully"));
-        sensorsValid = true;
-        verifyCalibration();
-        
-        // Handle SSR state after calibration
-        if (autoCalibrationInProgress) {
-          // Restore previous SSR state after automatic calibration
-          ssrEnabled = ssrStateBeforeCalibration;
-          ssrCommandState = ssrStateBeforeCalibration;
-          digitalWrite(SSR_CONTROL_PIN, ssrEnabled ? SSR_ON_STATE : SSR_OFF_STATE);
-          Serial.printf("✓ Auto-calibration complete - SSR restored to %s\n", 
-                       ssrEnabled ? "ON" : "OFF");
-          autoCalibrationInProgress = false;
-        } else {
-          // Initial/manual calibration - ensure SSR is ON after successful validation
-          ssrEnabled = true;
-          ssrCommandState = true;
-          digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
-          Serial.println(F("✓ SSR is ON - System operational"));
-        }
+        Serial.println(F("[4/4] Calibration verification PASSED"));
+        calState = CAL_COMPLETE;
       }
+      break;
+      
+    case CAL_COMPLETE:
+      Serial.println(F("\n=== CALIBRATION COMPLETE ==="));
+      Serial.printf("Current offset: %.3fV\n", calData.currentOffset);
+      Serial.printf("Voltage offset: %.3fV\n", calData.voltageOffset);
+      Serial.printf("Current cal factor: %.3f\n", calData.currentCalibration);
+      Serial.printf("Voltage cal factor: %.3f\n", calData.voltageCalibration);
+      Serial.println(F("============================\n"));
       
       saveCalibrationData();
-      
-      if (autoCalibrationInProgress) {
-        Serial.println(F("✓ Automatic recalibration complete - resuming monitoring"));
-      } else {
-        Serial.println(F("\n✓ System ready for operation"));
-      }
+      sensorsValid = true;
       currentState = STATE_MONITORING;
-      calState = CAL_COMPLETE;
-      digitalWrite(GREEN_LED_PIN, HIGH);
-      break;
+      lastCalibrationTime = now;
+      autoCalibrationInProgress = false;
       
-    default:
+      for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
+        currentBuffer[i] = 0.0;
+        voltageBuffer[i] = 0.0;
+      }
       break;
   }
 }
 
-// ==================== CALIBRATION VERIFICATION ====================
-void verifyCalibration() {
-  float testVoltage = calculateRMSVoltage(ZMPT101B_PIN);
-  
-  if (testVoltage > 100 && testVoltage < 300) {
-    Serial.println(F("✓ Voltage calibration verified (within normal range)"));
-  } else if (testVoltage > 50) {
-    Serial.println(F("⚠️  Voltage reading may need calibration"));
-    Serial.println(F("   Use 'cal_voltage' command with a multimeter"));
-  }
-}
-
-// ==================== HELPER: Read Raw Sensor Voltage ====================
-float readRawSensorVoltage(int pin, int samples) {
-  uint32_t sum = 0;
-  for (int i = 0; i < samples; i++) {
-    sum += analogRead(pin);
-  }
-  float avgRaw = (float)sum / samples;
-  return (avgRaw / ADC_RESOLUTION) * ADC_VREF;
-}
-
-// ==================== VOLTAGE CALIBRATION WIZARD ====================
+// NEW v5.3: Improved calibration wizard with strict validation
 void calibrateVoltageWithReference() {
   Serial.println(F("\n=== VOLTAGE CALIBRATION WIZARD ==="));
-  Serial.println(F("1. Measure your mains voltage with a multimeter"));
-  Serial.println(F("2. Enter the measured voltage (e.g., 230.5)"));
-  Serial.println(F("3. System will calculate calibration factor"));
-  Serial.print(F("\nEnter measured voltage in volts: "));
+  Serial.println(F("This will help you calibrate voltage reading"));
+  Serial.println(F("You need a multimeter to measure actual voltage\n"));
   
-  unsigned long startWait = millis();
-  const unsigned long timeout = 20000; // Reduced to 20s to avoid watchdog
-  
-  while(!Serial.available() && (millis() - startWait < timeout)) {
+  Serial.print(F("Taking 20 voltage samples... "));
+  float sum = 0.0;
+  for (int i = 0; i < 20; i++) {
+    sum += calculateRMSVoltage(ZMPT101B_PIN);
     delay(100);
     feedWatchdog();
   }
+  float measuredVoltage = sum / 20.0;
+  Serial.println(F("Done"));
   
-  if (Serial.available()) {
-    float measuredVoltage = Serial.parseFloat();
-    Serial.println(measuredVoltage);
-    
-    while(Serial.available()) Serial.read();
-    
-    if (measuredVoltage > 100.0 && measuredVoltage < 300.0) {
-      float currentReading = calculateRMSVoltage(ZMPT101B_PIN);
-      
-      if (currentReading > 1.0) {
-        calData.voltageCalibration = measuredVoltage / currentReading;
-        Serial.printf("✓ Voltage calibration factor: %.4f\n", calData.voltageCalibration);
-        Serial.printf("  Current reading: %.1fV → Target: %.1fV\n", currentReading, measuredVoltage);
-        saveCalibrationData();
-        verifyCalibration();
-      } else {
-        Serial.println(F("✗ ERROR: Voltage reading too low. Check sensor connection."));
-      }
-    } else {
-      Serial.println(F("✗ Invalid voltage value. Calibration cancelled."));
-    }
-  } else {
-    Serial.println(F("Timeout. Calibration cancelled."));
+  Serial.printf("\nCurrent reading: %.1f V\n", measuredVoltage);
+  
+  // NEW: Check if current reading is reasonable before proceeding
+  if (measuredVoltage < 50.0 || measuredVoltage > 500.0) {
+    Serial.println(F("\n*** ERROR: Current voltage reading out of range! ***"));
+    Serial.printf("Reading: %.1fV is not reasonable for Philippines (should be ~220V)\n", measuredVoltage);
+    Serial.println(F("Possible issues:"));
+    Serial.println(F("  1. ZMPT101B sensor not connected properly"));
+    Serial.println(F("  2. No AC voltage present"));
+    Serial.println(F("  3. Sensor faulty"));
+    Serial.println(F("\nCalibration aborted. Please check hardware.\n"));
+    return;
   }
+  
+  Serial.println(F("\nEnter actual voltage from multimeter (e.g., 220):"));
+  
+  while (Serial.available() == 0) {
+    feedWatchdog();
+    delay(100);
+  }
+  
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  float actualVoltage = input.toFloat();
+  
+  if (actualVoltage < 100 || actualVoltage > 300) {
+    Serial.println(F("Invalid voltage value! Must be between 100-300V"));
+    return;
+  }
+  
+  float newCalibration = actualVoltage / measuredVoltage * calData.voltageCalibration;
+  
+  // CRITICAL NEW: Apply calibration limits
+  if (newCalibration > MAX_VOLTAGE_CALIBRATION) {
+    Serial.println(F("\n*** WARNING: Calibration factor too high! ***"));
+    Serial.printf("Calculated: %.3f (would cause extreme readings)\n", newCalibration);
+    Serial.printf("Limiting to maximum: %.1f\n", MAX_VOLTAGE_CALIBRATION);
+    newCalibration = MAX_VOLTAGE_CALIBRATION;
+  } else if (newCalibration < MIN_VOLTAGE_CALIBRATION) {
+    Serial.println(F("\n*** WARNING: Calibration factor too low! ***"));
+    Serial.printf("Calculated: %.3f\n", newCalibration);
+    Serial.printf("Limiting to minimum: %.1f\n", MIN_VOLTAGE_CALIBRATION);
+    newCalibration = MIN_VOLTAGE_CALIBRATION;
+  }
+  
+  Serial.printf("\nActual voltage: %.1f V\n", actualVoltage);
+  Serial.printf("Measured voltage: %.1f V\n", measuredVoltage);
+  Serial.printf("Old calibration: %.3f\n", calData.voltageCalibration);
+  Serial.printf("New calibration: %.3f\n", newCalibration);
+  Serial.printf("Error: %.1f%%\n", (measuredVoltage - actualVoltage) / actualVoltage * 100.0);
+  
+  calData.voltageCalibration = newCalibration;
+  saveCalibrationData();
+  
+  Serial.println(F("\n✓ Voltage calibration updated"));
+  Serial.println(F("Testing new calibration...\n"));
+  
+  delay(1000);
+  sum = 0.0;
+  for (int i = 0; i < 20; i++) {
+    sum += calculateRMSVoltage(ZMPT101B_PIN);
+    delay(100);
+  }
+  float newReading = sum / 20.0;
+  
+  Serial.printf("New reading: %.1f V\n", newReading);
+  Serial.printf("Error: %.1f V (%.1f%%)\n", 
+               newReading - actualVoltage,
+               (newReading - actualVoltage) / actualVoltage * 100.0);
+  
+  // NEW: Final sanity check
+  if (newReading < 150.0 || newReading > 300.0) {
+    Serial.println(F("\n*** WARNING: Calibrated reading still out of range! ***"));
+    Serial.println(F("Consider resetting calibration or checking hardware."));
+  } else {
+    Serial.println(F("✓ Calibration appears successful"));
+  }
+  
+  Serial.println(F("============================\n"));
 }
 
-// ==================== SENSOR READING ====================
 void readSensors() {
   currentReading = calculateRMSCurrent();
   
   if (currentReading > MAX_VALID_CURRENT) {
-    Serial.printf("⚠️  Invalid current reading: %.2fA (clamping to 0)\n", currentReading);
+    Serial.printf("Invalid current: %.2fA\n", currentReading);
     currentReading = 0.0;
     sensorFaultDebounceCount++;
   }
   
   voltageReading = calculateRMSVoltage(ZMPT101B_PIN);
   
+  // NEW v5.3: Real-time voltage validation
+  if (voltageReading > SENSOR_FAULT_VOLTAGE) {
+    voltageErrorCount++;
+    if (voltageErrorCount >= 3) {
+      Serial.printf("\n*** CRITICAL ERROR: Voltage reading too high! ***\n");
+      Serial.printf("Reading: %.1fV (Normal: %.0fV)\n", voltageReading, NOMINAL_VOLTAGE);
+      Serial.println(F("This indicates:"));
+      Serial.println(F("  1. Incorrect ZMPT101B sensitivity setting"));
+      Serial.println(F("  2. Corrupted voltage calibration factor"));
+      Serial.println(F("  3. Sensor hardware fault"));
+      Serial.println(F("\nResetting voltage calibration to 1.0 for safety..."));
+      calData.voltageCalibration = 1.0;
+      saveCalibrationData();
+      voltageReading = calculateRMSVoltage(ZMPT101B_PIN);
+      Serial.printf("New reading after reset: %.1fV\n\n", voltageReading);
+      voltageErrorCount = 0;
+    }
+  } else {
+    voltageErrorCount = 0;  // Reset counter if reading is valid
+  }
+  
   apparentPower = voltageReading * currentReading;
   powerReading = apparentPower * calData.powerFactor;
-  
   updateStatistics();
 }
 
 float calculateRMSCurrent() {
-  float sum = 0;
-  int validSamples = 0;
+  uint32_t sumSquares = 0;
   
-  for(int i = 0; i < RMS_SAMPLES; i++) {
-    float voltage = readRawSensorVoltage(ACS712_PIN, ADC_SAMPLES_FAST);
-    
-    float actualACS712Voltage = voltage * VOLTAGE_DIVIDER_SCALE;
-    float calibratedZeroPoint = calData.currentOffset * VOLTAGE_DIVIDER_SCALE;
-    float currentDiff = actualACS712Voltage - calibratedZeroPoint;
-    float instantCurrent = currentDiff / ACS712_SENSITIVITY;
-    
-    sum += instantCurrent * instantCurrent;
-    validSamples++;
-    
+  for (int i = 0; i < RMS_SAMPLES; i++) {
+    float sensorVoltage = readRawSensorVoltage(ACS712_PIN, ADC_SAMPLES_FAST);
+    float offsetVoltage = sensorVoltage - calData.currentOffset;
+    float instantaneousCurrent = (offsetVoltage * VOLTAGE_DIVIDER_SCALE) / ACS712_SENSITIVITY;
+    sumSquares += (instantaneousCurrent * instantaneousCurrent);
     delayMicroseconds(RMS_SAMPLE_DELAY_US);
   }
   
-  if (validSamples > 0) {
-    float rms = sqrt(sum / validSamples);
-    return abs(rms * calData.currentCalibration);
-  }
-  
-  return 0.0;
+  float rms = sqrt((float)sumSquares / RMS_SAMPLES);
+  return rms * calData.currentCalibration;
 }
 
+// CRITICAL v5.3: Corrected voltage calculation with proper sensitivity
 float calculateRMSVoltage(int sensorPin) {
-  float sum = 0;
-  float maxReading = 0;
-  float minReading = ADC_VREF;
-  int validSamples = 0;
+  uint32_t sumSquares = 0;
+  float maxV = 0, minV = 3.3;
   
-  for(int i = 0; i < RMS_SAMPLES; i++) {
-    float voltage = readRawSensorVoltage(sensorPin, ADC_SAMPLES_FAST);
+  for (int i = 0; i < RMS_SAMPLES; i++) {
+    float sensorVoltage = readRawSensorVoltage(sensorPin, ADC_SAMPLES_FAST);
     
-    if (voltage > maxReading) maxReading = voltage;
-    if (voltage < minReading) minReading = voltage;
+    if (sensorVoltage > maxV) maxV = sensorVoltage;
+    if (sensorVoltage < minV) minV = sensorVoltage;
     
-    float acVoltage = voltage - calData.voltageOffset;
-    sum += acVoltage * acVoltage;
-    validSamples++;
+    float offsetVoltage = sensorVoltage - calData.voltageOffset;
     
+    // CRITICAL FIX v5.3: Using corrected sensitivity
+    // With ZMPT101B_SENSITIVITY = 0.004:
+    // For 220V RMS input → ~0.88V RMS sensor output
+    // offsetVoltage = 0.88V, instantaneousVoltage = 0.88 / 0.004 = 220V ✓
+    // Previous sensitivity 0.0053 would give: 0.88 / 0.0053 = 166V (wrong!)
+    float instantaneousVoltage = offsetVoltage / ZMPT101B_SENSITIVITY;
+    sumSquares += (instantaneousVoltage * instantaneousVoltage);
     delayMicroseconds(RMS_SAMPLE_DELAY_US);
   }
   
-  float rms = 0;
-  if (validSamples > 0) {
-    rms = sqrt(sum / validSamples);
-  }
-  
+  float rms = sqrt((float)sumSquares / RMS_SAMPLES);
   float scaledVoltage = rms * calData.voltageCalibration;
   
-  float swing = maxReading - minReading;
-  if (swing < MIN_AC_SWING && sensorsValid) {
+  // NEW v5.3: Additional runtime validation
+  if (scaledVoltage > 500.0 && calData.voltageCalibration > 1.5) {
+    // Extremely high reading with high calibration factor - likely error
+    static unsigned long lastWarning = 0;
+    if (millis() - lastWarning > 5000) {
+      Serial.println(F("\n*** WARNING: Abnormally high voltage detected! ***"));
+      Serial.printf("Reading: %.1fV with calibration factor: %.3f\n", 
+                   scaledVoltage, calData.voltageCalibration);
+      Serial.println(F("Consider running 'calibrate_voltage' command"));
+      lastWarning = millis();
+    }
+  }
+  
+  float swing = maxV - minV;
+  if (swing < MIN_AC_SWING) {
     static unsigned long lastWarning = 0;
     if (millis() - lastWarning > 10000) {
-      Serial.printf("⚠️  WARNING: Low AC swing (%.3fV). Check voltage sensor.\n", swing);
+      Serial.printf("Low AC swing: %.3fV\n", swing);
       lastWarning = millis();
     }
   }
@@ -769,68 +856,68 @@ float calculateRMSVoltage(int sensorPin) {
   return scaledVoltage;
 }
 
-// ==================== MOVING AVERAGE ====================
 void updateMovingAverages() {
   currentBuffer[bufferIndex] = currentReading;
   voltageBuffer[bufferIndex] = voltageReading;
-  
   bufferIndex = (bufferIndex + 1) % MOVING_AVERAGE_SIZE;
 }
 
 float getAverageCurrent() {
   float sum = 0.0;
-  for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
-    sum += currentBuffer[i];
-  }
+  for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) sum += currentBuffer[i];
   return sum / MOVING_AVERAGE_SIZE;
 }
 
 float getAverageVoltage() {
   float sum = 0.0;
-  for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
-    sum += voltageBuffer[i];
-  }
+  for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) sum += voltageBuffer[i];
   return sum / MOVING_AVERAGE_SIZE;
 }
 
-// ==================== SENSOR VALIDATION ====================
+// NEW v5.3: Enhanced validation with better error detection
 bool validateSensorReadings() {
-  if (voltageReading > SENSOR_FAULT_VOLTAGE) {
-    sensorFaultDetected = true;
-    return false;
-  }
-  
-  if (currentReading > MAX_SENSOR_CURRENT) {
-    sensorFaultDetected = true;
-    return false;
-  }
-  
-  if (isnan(voltageReading) || isnan(currentReading) || 
+  // Check for extreme values that indicate sensor faults
+  if (voltageReading > SENSOR_FAULT_VOLTAGE || currentReading > MAX_SENSOR_CURRENT ||
+      isnan(voltageReading) || isnan(currentReading) || 
       isinf(voltageReading) || isinf(currentReading)) {
     sensorFaultDetected = true;
+    
+    static unsigned long lastErrorLog = 0;
+    if (millis() - lastErrorLog > 5000) {
+      Serial.println(F("\n*** SENSOR VALIDATION FAILED ***"));
+      Serial.printf("Voltage: %.1fV (Limit: %.0fV)\n", voltageReading, SENSOR_FAULT_VOLTAGE);
+      Serial.printf("Current: %.3fA (Limit: %.0fA)\n", currentReading, MAX_SENSOR_CURRENT);
+      lastErrorLog = millis();
+    }
+    
     return false;
+  }
+  
+  // Check for unreasonably low voltage when AC should be present
+  if (voltageReading < MIN_VALID_VOLTAGE && voltageReading > 10.0) {
+    static unsigned long lastLowVoltageWarning = 0;
+    if (millis() - lastLowVoltageWarning > 10000) {
+      Serial.printf("WARNING: Low voltage detected: %.1fV\n", voltageReading);
+      lastLowVoltageWarning = millis();
+    }
   }
   
   sensorFaultDetected = false;
   return true;
 }
 
-// ==================== SAFETY CHECKS ====================
 void performSafetyChecks() {
   float avgCurrent = getAverageCurrent();
   float avgVoltage = getAverageVoltage();
   
   if (!sensorsValid) return;
   
-  // Overcurrent protection
   if (avgCurrent > MAX_CURRENT) {
     overcurrentDebounceCount++;
-    
     if (!overcurrentDetected) {
       overcurrentDetected = true;
       overcurrentStartTime = millis();
-      Serial.printf("⚠️  WARNING: Overcurrent! %.2fA > %.2fA (count: %d/%d)\n", 
-                    avgCurrent, MAX_CURRENT, overcurrentDebounceCount, SAFETY_DEBOUNCE_COUNT);
+      Serial.printf("Overcurrent: %.2fA\n", avgCurrent);
     }
     
     if (overcurrentDebounceCount >= SAFETY_DEBOUNCE_COUNT && 
@@ -843,15 +930,12 @@ void performSafetyChecks() {
     overcurrentDebounceCount = 0;
   }
   
-  // Overvoltage protection
   if (avgVoltage > MAX_VOLTAGE) {
     overvoltageDebounceCount++;
-    
     if (!overvoltageDetected) {
       overvoltageDetected = true;
       overvoltageStartTime = millis();
-      Serial.printf("⚠️  WARNING: Overvoltage! %.1fV > %.1fV (count: %d/%d)\n", 
-                    avgVoltage, MAX_VOLTAGE, overvoltageDebounceCount, SAFETY_DEBOUNCE_COUNT);
+      Serial.printf("Overvoltage: %.1fV\n", avgVoltage);
     }
     
     if (overvoltageDebounceCount >= SAFETY_DEBOUNCE_COUNT && 
@@ -864,22 +948,20 @@ void performSafetyChecks() {
     overvoltageDebounceCount = 0;
   }
   
-  // Undervoltage warning
   if (avgVoltage < MIN_VOLTAGE && avgVoltage > MIN_VALID_VOLTAGE) {
     if (!undervoltageDetected) {
       undervoltageDetected = true;
-      Serial.printf("⚠️  WARNING: Undervoltage! %.1fV < %.1fV\n", avgVoltage, MIN_VOLTAGE);
+      Serial.printf("Undervoltage: %.1fV\n", avgVoltage);
     }
   } else {
     undervoltageDetected = false;
   }
   
-  // Brown-out detection
   if (avgVoltage < BROWNOUT_VOLTAGE && avgVoltage > MIN_VALID_VOLTAGE) {
     if (!brownoutDetected) {
       brownoutDetected = true;
       brownoutStartTime = millis();
-      Serial.printf("⚠️  WARNING: Brown-out! %.1fV < %.1fV\n", avgVoltage, BROWNOUT_VOLTAGE);
+      Serial.printf("Brownout: %.1fV\n", avgVoltage);
     }
     
     if (millis() - brownoutStartTime > BROWNOUT_TIME) {
@@ -890,293 +972,802 @@ void performSafetyChecks() {
   }
 }
 
-// ==================== BROWN-OUT HANDLER ====================
-void handleBrownout() {
-  Serial.println(F("⚠️  Extended brown-out detected - protecting load"));
-  
-  if (ssrEnabled) {
-    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-    ssrEnabled = false;
-    Serial.println(F("   Load disconnected to prevent damage"));
-  }
-}
-
-// ==================== SAFETY SHUTDOWN ====================
 void triggerSafetyShutdown(const char* reason) {
-  Serial.printf("\n🚨 SAFETY SHUTDOWN: %s\n", reason);
+  Serial.printf("\n*** SAFETY SHUTDOWN: %s ***\n", reason);
   
-  // MODIFIED: Turn OFF SSR during anomaly
   digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
   ssrEnabled = false;
   ssrCommandState = false;
-  
   currentState = STATE_ERROR;
-  shutdownCount++;
   
   digitalWrite(RED_LED_PIN, HIGH);
   digitalWrite(GREEN_LED_PIN, LOW);
   
   if (buzzerEnabled) {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
       digitalWrite(BUZZER_PIN, HIGH);
-      delay(150);
+      delay(100);
       digitalWrite(BUZZER_PIN, LOW);
       delay(100);
-      feedWatchdog();
     }
   }
   
+  Serial.printf("Voltage: %.1fV\n", voltageReading);
+  Serial.printf("Current: %.3fA\n", currentReading);
+  Serial.printf("Power: %.1fW\n", powerReading);
+  Serial.println(F("Type 'recovery' or 'reset' to recover\n"));
+  
+  shutdownCount++;
+  
   if (sdCardAvailable) {
-    char logBuffer[64];
-    snprintf(logBuffer, sizeof(logBuffer), "SHUTDOWN,%s,%lu", reason, millis());
+    char logBuffer[128];
+    snprintf(logBuffer, sizeof(logBuffer), "SHUTDOWN,%s,%.1f,%.3f,%lu",
+             reason, voltageReading, currentReading, millis());
     logToSD(logBuffer);
   }
-  
-  Serial.println(F("*** SYSTEM IN SAFETY SHUTDOWN ***"));
-  Serial.println(F("*** SSR is OFF due to anomaly ***"));
-  Serial.println(F("Type 'reset' to acknowledge and restart"));
 }
 
-// ==================== SSR STATE VERIFICATION ====================
-void verifySSRState() {
-  // Verify the SSR command state matches actual state
-  bool expectedState = ssrCommandState;
+void handleBrownout() {
+  Serial.println(F("\n*** BROWNOUT CONDITION ***"));
+  Serial.println(F("Extended low voltage detected"));
   
-  if (ssrEnabled != expectedState && currentState != STATE_ERROR) {
-    Serial.println(F("⚠️  SSR state mismatch detected!"));
-    Serial.printf("   Expected: %s, Actual: %s\n", 
-                  expectedState ? "ON" : "OFF",
-                  ssrEnabled ? "ON" : "OFF");
-    
-    // Force state to match command
-    digitalWrite(SSR_CONTROL_PIN, expectedState ? SSR_ON_STATE : SSR_OFF_STATE);
-    ssrEnabled = expectedState;
+  if (autoRecoveryMode) {
+    triggerSafetyShutdown("BROWNOUT");
+  } else {
+    Serial.println(F("Monitoring voltage..."));
   }
 }
 
-// ==================== ENERGY CALCULATION ====================
 void updateEnergyCalculation() {
-  static unsigned long lastUpdate = 0;
-  unsigned long currentTime = millis();
-  
-  if (lastUpdate > 0 && ssrEnabled && powerReading > 0.1) {
-    float deltaTime = (currentTime - lastUpdate) / 1000.0 / 3600.0;
-    energyConsumed += powerReading * deltaTime;
+  unsigned long now = millis();
+  if (lastEnergyUpdate == 0) {
+    lastEnergyUpdate = now;
+    return;
   }
   
-  lastUpdate = currentTime;
+  float hours = (now - lastEnergyUpdate) / 3600000.0;
+  energyConsumed += (powerReading * hours);
+  lastEnergyUpdate = now;
 }
 
-// ==================== STATISTICS ====================
 void updateStatistics() {
-  if (currentReading > maxCurrent && currentReading < MAX_VALID_CURRENT) {
-    maxCurrent = currentReading;
-  }
-  
-  if (voltageReading > maxVoltage && voltageReading < SENSOR_FAULT_VOLTAGE) {
-    maxVoltage = voltageReading;
-  }
-  
-  if (voltageReading < minVoltage && voltageReading > MIN_VALID_VOLTAGE) {
-    minVoltage = voltageReading;
-  }
-  
-  if (powerReading > maxPower) {
-    maxPower = powerReading;
+  if (currentReading > maxCurrent) maxCurrent = currentReading;
+  if (voltageReading > maxVoltage) maxVoltage = voltageReading;
+  if (voltageReading < minVoltage && voltageReading > MIN_VALID_VOLTAGE) minVoltage = voltageReading;
+  if (powerReading > maxPower) maxPower = powerReading;
+}
+
+void updateStatusLEDs() {
+  if (currentState == STATE_ERROR || sensorFaultDetected) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, LOW);
+  } else if (pirState == PIR_MOTION_DETECTED) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, LOW);
+  } else if (ssrEnabled && sensorsValid) {
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  } else {
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
   }
 }
 
-// ==================== PERFORMANCE METRICS ====================
+void updateDisplay() {
+  Serial.printf("V:%.1f I:%.3f P:%.1f SSR:%s PIR:%s Load:%s E:%.2f State:%s\n",
+                voltageReading, currentReading, powerReading,
+                ssrEnabled ? "ON" : "OFF",
+                getPIRStateString().c_str(),
+                loadDetected ? "YES" : "NO",
+                energyConsumed,
+                getStateString().c_str());
+}
+
+String getStateString() {
+  switch (currentState) {
+    case STATE_INITIALIZING: return "INIT";
+    case STATE_CALIBRATING: return "CAL";
+    case STATE_MONITORING: return "MONITOR";
+    case STATE_MANUAL_CONTROL: return "MANUAL";
+    case STATE_ERROR: return "ERROR";
+    case STATE_RECOVERY: return "RECOVERY";
+    case STATE_SHUTDOWN: return "SHUTDOWN";
+    default: return "UNKNOWN";
+  }
+}
+
+String getPIRStateString() {
+  switch (pirState) {
+    case PIR_INACTIVE: return "INACTIVE";
+    case PIR_MONITORING: return "MONITOR";
+    case PIR_MOTION_DETECTED: return "MOTION";
+    case PIR_COOLDOWN: return "COOLDOWN";
+    default: return "UNKNOWN";
+  }
+}
+
+float readRawSensorVoltage(int pin, int samples) {
+  uint32_t sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+  }
+  float avgADC = (float)sum / samples;
+  return (avgADC / ADC_RESOLUTION) * ADC_VREF;
+}
+
+void verifySSRState() {
+  if (ssrCommandState != ssrEnabled) {
+    Serial.println(F("SSR state mismatch - correcting..."));
+    digitalWrite(SSR_CONTROL_PIN, ssrCommandState ? SSR_ON_STATE : SSR_OFF_STATE);
+    ssrEnabled = ssrCommandState;
+  }
+}
+
+// NEW v5.3: Comprehensive calibration verification
+void verifyCalibration() {
+  Serial.println(F("\n=== CALIBRATION CHECK ==="));
+  Serial.printf("Current offset: %.3fV\n", calData.currentOffset);
+  Serial.printf("Voltage offset: %.3fV\n", calData.voltageOffset);
+  Serial.printf("Current cal: %.3f\n", calData.currentCalibration);
+  Serial.printf("Voltage cal: %.3f\n", calData.voltageCalibration);
+  Serial.printf("ZMPT Sensitivity: %.4f V/V\n", ZMPT101B_SENSITIVITY);
+  
+  bool valid = true;
+  
+  if (calData.currentOffset < EXPECTED_OFFSET_MIN || calData.currentOffset > EXPECTED_OFFSET_MAX) {
+    Serial.println(F("WARNING: Current offset out of range"));
+    valid = false;
+  }
+  
+  if (calData.voltageOffset < 1.5 || calData.voltageOffset > 1.8) {
+    Serial.println(F("WARNING: Voltage offset out of range"));
+    valid = false;
+  }
+  
+  // NEW: Check calibration factors
+  if (calData.voltageCalibration > MAX_VOLTAGE_CALIBRATION || 
+      calData.voltageCalibration < MIN_VOLTAGE_CALIBRATION) {
+    Serial.println(F("*** ERROR: Voltage calibration factor out of safe range! ***"));
+    Serial.printf("Current: %.3f (Safe range: %.1f - %.1f)\n", 
+                 calData.voltageCalibration, MIN_VOLTAGE_CALIBRATION, MAX_VOLTAGE_CALIBRATION);
+    Serial.println(F("Resetting to 1.0 for safety..."));
+    calData.voltageCalibration = 1.0;
+    saveCalibrationData();
+    valid = false;
+  }
+  
+  if (calData.currentCalibration > MAX_CURRENT_CALIBRATION || 
+      calData.currentCalibration < MIN_CURRENT_CALIBRATION) {
+    Serial.println(F("WARNING: Current calibration factor out of safe range"));
+    valid = false;
+  }
+  
+  Serial.printf("Status: %s\n", valid ? "OK" : "NEEDS CALIBRATION");
+  Serial.println(F("========================\n"));
+}
+
+// NEW v5.3: Validate calibration data before use
+void validateCalibrationData() {
+  bool needsReset = false;
+  
+  Serial.println(F("\n=== VALIDATING CALIBRATION ==="));
+  
+  // Check voltage calibration factor
+  if (calData.voltageCalibration > MAX_VOLTAGE_CALIBRATION) {
+    Serial.printf("ERROR: Voltage cal too high: %.3f (max: %.1f)\n", 
+                 calData.voltageCalibration, MAX_VOLTAGE_CALIBRATION);
+    Serial.println(F("This would cause extremely high voltage readings!"));
+    calData.voltageCalibration = 1.0;
+    needsReset = true;
+  } else if (calData.voltageCalibration < MIN_VOLTAGE_CALIBRATION) {
+    Serial.printf("ERROR: Voltage cal too low: %.3f (min: %.1f)\n", 
+                 calData.voltageCalibration, MIN_VOLTAGE_CALIBRATION);
+    calData.voltageCalibration = 1.0;
+    needsReset = true;
+  }
+  
+  // Check current calibration factor
+  if (calData.currentCalibration > MAX_CURRENT_CALIBRATION || 
+      calData.currentCalibration < MIN_CURRENT_CALIBRATION) {
+    Serial.printf("WARNING: Current cal out of range: %.3f\n", calData.currentCalibration);
+    calData.currentCalibration = 1.0;
+    needsReset = true;
+  }
+  
+  if (needsReset) {
+    Serial.println(F("\n*** CALIBRATION RESET TO SAFE DEFAULTS ***"));
+    Serial.println(F("Reason: Potentially corrupted calibration data detected"));
+    Serial.println(F("This prevents voltage readings like 20kV"));
+    Serial.println(F("\nRecommendation: Run 'calibrate_voltage' after testing"));
+    saveCalibrationData();
+  } else {
+    Serial.println(F("✓ Calibration data valid"));
+  }
+  
+  Serial.println(F("==============================\n"));
+}
+
 void updatePerformanceMetrics(unsigned long loopTime) {
   perfMetrics.loopTimeSum += loopTime;
   perfMetrics.sampleCount++;
   
-  if (loopTime > perfMetrics.maxLoopTime) {
-    perfMetrics.maxLoopTime = loopTime;
-  }
-  
-  if (loopTime < perfMetrics.minLoopTime) {
-    perfMetrics.minLoopTime = loopTime;
-  }
+  if (loopTime > perfMetrics.maxLoopTime) perfMetrics.maxLoopTime = loopTime;
+  if (loopTime < perfMetrics.minLoopTime) perfMetrics.minLoopTime = loopTime;
   
   if (perfMetrics.sampleCount >= PERF_SAMPLES) {
     perfMetrics.avgLoopTime = perfMetrics.loopTimeSum / perfMetrics.sampleCount;
-    
-    // Reset for next window
     perfMetrics.loopTimeSum = 0;
     perfMetrics.sampleCount = 0;
   }
 }
 
-// ==================== STATUS LEDs ====================
-void updateStatusLEDs() {
-  static unsigned long lastBlink = 0;
-  static bool blinkState = false;
-  
-  switch (currentState) {
-    case STATE_MONITORING:
-      if (ssrEnabled) {
-        digitalWrite(GREEN_LED_PIN, HIGH);
-        digitalWrite(RED_LED_PIN, LOW);
-      } else {
-        // MODIFIED: Blink RED when SSR is OFF (anomaly condition)
-        if (millis() - lastBlink > 500) {
-          blinkState = !blinkState;
-          digitalWrite(RED_LED_PIN, blinkState);
-          lastBlink = millis();
-        }
-        digitalWrite(GREEN_LED_PIN, LOW);
-      }
-      break;
-      
-    case STATE_ERROR:
-      if (millis() - lastBlink > 250) {
-        blinkState = !blinkState;
-        digitalWrite(RED_LED_PIN, blinkState);
-        lastBlink = millis();
-      }
-      digitalWrite(GREEN_LED_PIN, LOW);
-      break;
-      
-    case STATE_MANUAL_CONTROL:
-      digitalWrite(GREEN_LED_PIN, HIGH);
-      digitalWrite(RED_LED_PIN, HIGH);
-      break;
-      
-    default:
-      digitalWrite(GREEN_LED_PIN, LOW);
-      digitalWrite(RED_LED_PIN, LOW);
-      break;
+bool isSafeToOperate() {
+  return sensorsValid && 
+         !sensorFaultDetected && 
+         !overcurrentDetected && 
+         !overvoltageDetected && 
+         voltageReading > MIN_VALID_VOLTAGE &&
+         voltageReading < SENSOR_FAULT_VOLTAGE;
+}
+
+void setupWatchdog() {
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+  Serial.printf("Watchdog: %ds timeout\n", WATCHDOG_TIMEOUT_S);
+}
+
+void feedWatchdog() {
+  unsigned long now = millis();
+  if (now - lastWatchdogFeed >= 1000) {
+    esp_task_wdt_reset();
+    lastWatchdogFeed = now;
   }
 }
 
-// ==================== DISPLAY UPDATE ====================
-void updateDisplay() {
-  if (!sensorsValid) {
-    Serial.println(F("\n⚠️  ========================================"));
-    Serial.println(F("   SENSOR VALIDATION FAILED"));
-    Serial.println(F("   System in SAFE MODE"));
-    Serial.println(F("   Type 'test' to see raw readings"));
-    Serial.println(F("   Type 'calibrate' to recalibrate"));
-    Serial.println(F("========================================\n"));
+void connectToWiFi() {
+  if (strlen(WIFI_SSID) == 0 || strcmp(WIFI_SSID, "YOUR_WIFI_SSID") == 0) {
+    Serial.println(F("WiFi: Disabled (no SSID configured)"));
+    wifiEnabled = false;
     return;
   }
   
-  Serial.println(F("\n========================================"));
-  Serial.printf("Status: %s | SSR: %s | Loops: %lu\n", 
-                getStateString().c_str(), 
-                ssrEnabled ? "ON" : "OFF (ANOMALY)",
-                loopCount);
-  Serial.println(F("----------------------------------------"));
+  wifiEnabled = true;
+  Serial.print(F("Connecting to WiFi"));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
-  Serial.printf("Voltage: %.1f V (Avg: %.1f V)\n", voltageReading, getAverageVoltage());
-  Serial.printf("Current: %.3f A (Avg: %.3f A)\n", currentReading, getAverageCurrent());
-  Serial.printf("Power: %.1f W (Apparent: %.1f VA, PF=%.2f)\n", powerReading, apparentPower, calData.powerFactor);
-  Serial.printf("Energy: %.3f Wh\n", energyConsumed);
-  
-  if (perfMetrics.avgLoopTime > 0) {
-    Serial.printf("Loop: %lu ms (min: %lu, max: %lu)\n", 
-                  perfMetrics.avgLoopTime, perfMetrics.minLoopTime, perfMetrics.maxLoopTime);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(F("."));
+    feedWatchdog();
   }
   
-  if (overcurrentDetected || overvoltageDetected || undervoltageDetected || brownoutDetected) {
-    Serial.println(F("----------------------------------------"));
-    Serial.println(F("*** WARNINGS ***"));
-    if (overcurrentDetected) Serial.printf("⚠️  OVERCURRENT: %.2fA\n", getAverageCurrent());
-    if (overvoltageDetected) Serial.printf("⚠️  OVERVOLTAGE: %.1fV\n", getAverageVoltage());
-    if (undervoltageDetected) Serial.printf("⚠️  UNDERVOLTAGE: %.1fV\n", getAverageVoltage());
-    if (brownoutDetected) Serial.printf("⚠️  BROWN-OUT: %.1fV\n", getAverageVoltage());
-  }
-  
-  Serial.println(F("========================================\n"));
-}
-
-String getStateString() {
-  switch (currentState) {
-    case STATE_INITIALIZING: return F("INIT");
-    case STATE_CALIBRATING: return F("CALIB");
-    case STATE_MONITORING: return F("MONITOR");
-    case STATE_MANUAL_CONTROL: return F("MANUAL");
-    case STATE_ERROR: return F("ERROR");
-    case STATE_SHUTDOWN: return F("SHUTDOWN");
-    default: return F("UNKNOWN");
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println(F(" OK"));
+    Serial.print(F("IP: "));
+    Serial.println(WiFi.localIP());
+    Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+  } else {
+    wifiConnected = false;
+    Serial.println(F(" FAILED"));
+    Serial.println(F("Running in standalone mode"));
   }
 }
 
-// ==================== EMERGENCY RESET ====================
-void emergencyReset() {
-  Serial.println(F("\n🔄 EMERGENCY RESET"));
+void checkWiFiConnection() {
+  if (!wifiEnabled) return;
   
-  currentState = STATE_CALIBRATING;
-  calState = CAL_CURRENT_SAMPLING;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiConnected) {
+      Serial.println(F("WiFi disconnected"));
+      wifiConnected = false;
+      wsConnected = false;
+    }
+    
+    Serial.print(F("Reconnecting to WiFi..."));
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
+      delay(500);
+      Serial.print(F("."));
+      feedWatchdog();
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println(F(" OK"));
+      wifiConnected = true;
+    } else {
+      Serial.println(F(" FAILED"));
+    }
+  } else if (!wifiConnected) {
+    wifiConnected = true;
+    Serial.println(F("WiFi reconnected"));
+  }
+}
+
+void initWebSocket() {
+  if (!wifiConnected) return;
   
-  // MODIFIED: Reset to ON state (default behavior)
-  digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
-  ssrEnabled = true;
-  ssrCommandState = true;
+  Serial.println(F("\n=== WEBSOCKET INITIALIZATION ==="));
+  secureClient.setInsecure();
   
-  overcurrentDetected = false;
-  overvoltageDetected = false;
-  undervoltageDetected = false;
-  brownoutDetected = false;
-  sensorFaultDetected = false;
+  webSocket.beginSSL(SERVER_HOST, SERVER_PORT, WS_PATH);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  
+  Serial.printf("Connecting to: wss://%s:%d%s\n", SERVER_HOST, SERVER_PORT, WS_PATH);
+  Serial.println(F("================================\n"));
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println(F("✗ WebSocket Disconnected"));
+      wsConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      {
+        Serial.println(F("✓ WebSocket Connected"));
+        Serial.printf("URL: %s\n", payload);
+        wsConnected = true;
+        
+        StaticJsonDocument<256> doc;
+        doc["type"] = "register";
+        doc["deviceId"] = DEVICE_ID;
+        doc["deviceType"] = DEVICE_TYPE;
+        
+        String output;
+        serializeJson(doc, output);
+        webSocket.sendTXT(output);
+        Serial.println(F("→ Registration sent"));
+      }
+      break;
+      
+    case WStype_TEXT:
+      {
+        Serial.printf("← WebSocket message: %s\n", payload);
+        
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, payload);
+        
+        if (!error) {
+          const char* type = doc["type"];
+          
+          if (strcmp(type, "welcome") == 0) {
+            Serial.println(F("✓ Welcome message received"));
+          }
+          else if (strcmp(type, "registered") == 0) {
+            Serial.println(F("✓ Device registered with server"));
+          }
+          else if (strcmp(type, "pong") == 0) {
+            // Pong response
+          }
+          else if (doc.containsKey("command")) {
+            const char* command = doc["command"];
+            Serial.printf("→ Executing command: %s\n", command);
+            processCommand(command);
+            
+            StaticJsonDocument<256> ackDoc;
+            ackDoc["type"] = "commandAck";
+            ackDoc["command"] = command;
+            ackDoc["success"] = true;
+            ackDoc["timestamp"] = millis();
+            
+            String ackOutput;
+            serializeJson(ackDoc, ackOutput);
+            webSocket.sendTXT(ackOutput);
+          }
+        }
+      }
+      break;
+      
+    case WStype_ERROR:
+      Serial.println(F("✗ WebSocket Error"));
+      break;
+      
+    case WStype_BIN:
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+    case WStype_PING:
+    case WStype_PONG:
+      break;
+  }
+}
+
+void sendDataToServer() {
+  if (!wifiConnected || !sensorsValid) return;
+  
+  StaticJsonDocument<512> doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["deviceType"] = DEVICE_TYPE;
+  doc["voltage"] = round(voltageReading * 10.0) / 10.0;
+  doc["current"] = round(currentReading * 1000.0) / 1000.0;
+  doc["power"] = round(powerReading * 10.0) / 10.0;
+  doc["energy"] = round(energyConsumed * 1000.0) / 1000.0;
+  doc["ssrState"] = ssrEnabled;
+  doc["state"] = getStateString();
+  doc["sensors"] = "valid";
+  doc["pirEnabled"] = pirEnabled;
+  doc["pirState"] = getPIRStateString();
+  doc["loadDetected"] = loadDetected;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  HTTPClient http;
+  secureClient.setInsecure();
+  
+  String url = String("https://") + SERVER_HOST + SERVER_ENDPOINT;
+  http.begin(secureClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(SERVER_TIMEOUT);
+  
+  int httpCode = http.POST(jsonString);
+  
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+    serverConnected = true;
+    serverSuccessCount++;
+    
+    String response = http.getString();
+    StaticJsonDocument<256> responseDoc;
+    DeserializationError error = deserializeJson(responseDoc, response);
+    
+    if (!error && responseDoc.containsKey("command")) {
+      const char* command = responseDoc["command"];
+      Serial.printf("→ Server command: %s\n", command);
+      processCommand(command);
+    }
+  } else {
+    serverConnected = false;
+    serverErrorCount++;
+    
+    static unsigned long lastError = 0;
+    if (millis() - lastError > 30000) {
+      Serial.printf("✗ Server error: %d\n", httpCode);
+      lastError = millis();
+    }
+  }
+  
+  http.end();
+}
+
+void initPIRSensor() {
+  pinMode(PIR_SENSOR_PIN, INPUT);
+  delay(2000);
+  
+  Serial.print(F("PIR sensor: "));
+  if (digitalRead(PIR_SENSOR_PIN) == LOW) {
+    Serial.println(F("OK (Ready)"));
+    if (pirEnabled) {
+      pirState = PIR_MONITORING;
+    }
+  } else {
+    Serial.println(F("WARNING (HIGH state)"));
+  }
+}
+
+// IMPROVED PIR CHILD SAFETY WITH STABLE LOAD DETECTION
+void updatePIRChildSafety() {
+  unsigned long now = millis();
+  
+  // Check PIR at faster interval for quicker response
+  if (now - lastPirCheck < PIR_CHECK_INTERVAL) return;
+  lastPirCheck = now;
+  
+  // Read PIR sensor
+  int pirValue = digitalRead(PIR_SENSOR_PIN);
+  bool currentMotion = (pirValue == HIGH);
+  
+  // Check if load is plugged in (more stable detection)
+  bool currentLoadState = checkLoadPluggedIn();
+  
+  // Handle load state changes with proper hysteresis
+  if (currentLoadState != loadDetected) {
+    if (currentLoadState) {
+      // Load was just detected
+      loadDetected = true;
+      loadLostTime = 0;  // Reset lost timer
+      Serial.println(F("Load DETECTED - PIR monitoring active"));
+    } else {
+      // Load might be lost - start confirmation timer
+      if (loadLostTime == 0) {
+        loadLostTime = now;
+      } else if (now - loadLostTime > LOAD_LOST_TIME) {
+        // Load confirmed lost after LOAD_LOST_TIME
+        loadDetected = false;
+        loadLostTime = 0;
+        Serial.println(F("Load REMOVED - PIR standby"));
+        
+        // Restore power if it was off and no other safety issues
+        if (!ssrEnabled && pirState != PIR_MOTION_DETECTED && 
+            !sensorFaultDetected && !overcurrentDetected && 
+            !overvoltageDetected && safetyEnabled) {
+          digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+          ssrEnabled = true;
+          ssrCommandState = true;
+          Serial.println(F("Power restored (no load)"));
+        }
+        
+        // Reset PIR state when no load
+        if (pirState != PIR_INACTIVE) {
+          pirState = PIR_MONITORING;
+        }
+      }
+    }
+  } else if (currentLoadState) {
+    // Load is stable - reset lost timer
+    loadLostTime = 0;
+  }
+  
+  // Only process PIR motion if load is detected
+  if (!loadDetected) {
+    return;  // No load, no need to monitor motion
+  }
+  
+  // Debounce PIR motion detection
+  if (currentMotion != pirMotionDetected && now - lastPirChange > PIR_DEBOUNCE_TIME) {
+    pirMotionDetected = currentMotion;
+    lastPirChange = now;
+    
+    if (currentMotion) {
+      // Motion detected
+      lastMotionTime = now;
+      if (pirState == PIR_MONITORING) {
+        handlePIRMotion();
+      }
+    } else {
+      // Motion stopped
+      lastNoMotionTime = now;
+    }
+  }
+  
+  // Handle timeout after motion detected
+  if (pirState == PIR_MOTION_DETECTED && now - lastMotionTime > PIR_MOTION_TIMEOUT) {
+    handlePIRNoMotion();
+  }
+}
+
+// IMPROVED: More stable load detection
+bool checkLoadPluggedIn() {
+  float avgCurrent = getAverageCurrent();
+  
+  // Check if current is above threshold
+  if (avgCurrent > LOAD_DETECTION_THRESHOLD) {
+    // Start tracking load detection time
+    if (loadDetectedTime == 0) {
+      loadDetectedTime = millis();
+    } 
+    // Confirm load after stable time
+    else if (millis() - loadDetectedTime > LOAD_STABLE_TIME) {
+      return true;  // Load confirmed
+    }
+    // Still waiting for stability
+    return loadDetected;  // Keep previous state while waiting
+  } else {
+    // Current below threshold - reset detection timer
+    loadDetectedTime = 0;
+    
+    // If load was detected, we need to wait for LOAD_LOST_TIME
+    // before declaring it lost (handled in updatePIRChildSafety)
+    return loadDetected;
+  }
+}
+
+void handlePIRMotion() {
+  Serial.println(F("\n*** PIR ALERT ***"));
+  Serial.println(F("MOTION DETECTED with LOAD!"));
+  Serial.println(F("Shutting down for safety"));
+  
+  pirState = PIR_MOTION_DETECTED;
+  pirTriggerCount++;
+  lastMotionTime = millis();
+  
+  // Turn off power immediately when motion detected with load
+  if (ssrEnabled) {
+    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+    ssrEnabled = false;
+    ssrCommandState = false;
+    Serial.println(F("SSR OFF"));
+  }
+  
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  pirAlert();
+  
+  Serial.printf("OFF for %d sec\n", PIR_MOTION_TIMEOUT / 1000);
+  Serial.println();
+  
+  if (sdCardAvailable) {
+    char logBuffer[64];
+    snprintf(logBuffer, sizeof(logBuffer), "PIR_MOTION,%lu", millis());
+    logToSD(logBuffer);
+  }
+}
+
+void handlePIRNoMotion() {
+  Serial.println(F("\n*** PIR CLEAR ***"));
+  Serial.println(F("No motion detected"));
+  
+  // Only re-enable if load is still connected
+  if (loadDetected) {
+    Serial.println(F("Re-enabling power (load still connected)"));
+    
+    pirState = PIR_MONITORING;
+    
+    if (!sensorFaultDetected && !overcurrentDetected && !overvoltageDetected && 
+        currentState != STATE_ERROR && safetyEnabled) {
+      digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+      ssrEnabled = true;
+      ssrCommandState = true;
+      Serial.println(F("SSR ON"));
+    }
+    
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    
+    if (buzzerEnabled) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(100);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  } else {
+    Serial.println(F("Load removed - staying in monitoring mode"));
+    pirState = PIR_MONITORING;
+  }
+  
+  Serial.println();
+}
+
+void enablePIR() {
+  pirEnabled = true;
+  pirState = PIR_MONITORING;
+  Serial.println(F("PIR: ENABLED"));
+}
+
+void disablePIR() {
+  pirEnabled = false;
+  pirState = PIR_INACTIVE;
+  pirMotionDetected = false;
+  loadDetected = false;
+  Serial.println(F("PIR: DISABLED"));
+}
+
+void pirAlert() {
+  if (!buzzerEnabled) return;
+  for (int i = 0; i < PIR_ALERT_BEEPS; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(150);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(150);
+  }
+}
+
+void printPIRStatus() {
+  Serial.println(F("\n=== PIR STATUS ==="));
+  Serial.printf("Enabled: %s\n", pirEnabled ? "YES" : "NO");
+  Serial.printf("State: %s\n", getPIRStateString().c_str());
+  Serial.printf("Motion: %s\n", pirMotionDetected ? "YES" : "NO");
+  Serial.printf("Load: %s\n", loadDetected ? "YES" : "NO");
+  Serial.printf("Triggers: %d\n", pirTriggerCount);
+  Serial.printf("Current: %.3fA (Threshold: %.2fA)\n", getAverageCurrent(), LOAD_DETECTION_THRESHOLD);
+  Serial.println(F("==================\n"));
+}
+
+void attemptAutoRecovery() {
+  unsigned long now = millis();
+  
+  if (autoRecoveryAttempts >= MAX_AUTO_RECOVERY_ATTEMPTS) {
+    Serial.println(F("\n*** MAX RECOVERY ATTEMPTS REACHED ***"));
+    Serial.println(F("Manual intervention required"));
+    Serial.println(F("Type 'reset' to restart system\n"));
+    currentState = STATE_ERROR;
+    criticalError = true;
+    criticalErrorStartTime = now;
+    return;
+  }
+  
+  if (now - lastRecoveryAttempt < RECOVERY_DELAY_MS) {
+    return;
+  }
+  
+  Serial.printf("\n=== AUTO RECOVERY ATTEMPT %d/%d ===\n", 
+               autoRecoveryAttempts + 1, MAX_AUTO_RECOVERY_ATTEMPTS);
+  
+  autoRecoveryAttempts++;
+  lastRecoveryAttempt = now;
+  
+  if (sensorFaultDetected) {
+    recoverFromSensorFault();
+  }
+  
+  if (performSelfDiagnostic()) {
+    Serial.println(F("✓ Recovery successful\n"));
+    currentState = STATE_MONITORING;
+    autoRecoveryMode = false;
+    autoRecoveryAttempts = 0;
+    resetErrorCounters();
+  } else {
+    Serial.println(F("✗ Recovery failed, will retry\n"));
+  }
+}
+
+void recoverFromSensorFault() {
+  Serial.println(F("Attempting sensor fault recovery..."));
+  
+  // Reset sensor readings
+  for (int i = 0; i < MOVING_AVERAGE_SIZE; i++) {
+    currentBuffer[i] = 0.0;
+    voltageBuffer[i] = 0.0;
+  }
+  
+  // Take fresh readings
+  delay(1000);
+  readSensors();
+  
+  Serial.printf("New readings: V=%.1fV I=%.3fA\n", voltageReading, currentReading);
+}
+
+void handleCriticalError() {
+  unsigned long now = millis();
+  
+  if (now - criticalErrorStartTime > CRITICAL_ERROR_RESTART_TIME) {
+    Serial.println(F("\n*** CRITICAL ERROR TIMEOUT ***"));
+    Serial.println(F("Automatic restart in 5 seconds..."));
+    delay(5000);
+    ESP.restart();
+  }
+}
+
+bool performSelfDiagnostic() {
+  Serial.println(F("\nRunning self-diagnostic..."));
+  
+  bool passed = true;
+  
+  // Check sensor readings
+  readSensors();
+  if (!validateSensorReadings()) {
+    Serial.println(F("✗ Sensor validation failed"));
+    passed = false;
+  } else {
+    Serial.println(F("✓ Sensors OK"));
+  }
+  
+  // Check voltage range
+  if (voltageReading < MIN_VALID_VOLTAGE || voltageReading > SENSOR_FAULT_VOLTAGE) {
+    Serial.println(F("✗ Voltage out of range"));
+    passed = false;
+  } else {
+    Serial.println(F("✓ Voltage OK"));
+  }
+  
+  // Check current
+  if (currentReading > MAX_SENSOR_CURRENT) {
+    Serial.println(F("✗ Current too high"));
+    passed = false;
+  } else {
+    Serial.println(F("✓ Current OK"));
+  }
+  
+  return passed;
+}
+
+void resetErrorCounters() {
   overcurrentDebounceCount = 0;
   overvoltageDebounceCount = 0;
   sensorFaultDebounceCount = 0;
-  criticalError = false;
-  
-  digitalWrite(RED_LED_PIN, LOW);
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  
-  Serial.println(F("Recalibrating sensors..."));
-  calProgress.samplesCollected = 0;
-  calProgress.currentSum = 0.0;
-  calProgress.voltageSum = 0.0;
-  calProgress.startTime = millis();
-  
-  // Allow non-blocking calibration to run
-  while (calState != CAL_COMPLETE && (millis() - calProgress.startTime < 10000)) {
-    autoCalibrateSensorsNonBlocking();
-    feedWatchdog();
-    delay(10);
-  }
-  
-  if (calState == CAL_COMPLETE) {
-    Serial.println(F("✓ System reset complete"));
-    Serial.println(F("✓ SSR returned to ON state"));
-  } else {
-    Serial.println(F("⚠️  Reset timeout - manual calibration may be needed"));
-  }
+  voltageErrorCount = 0;
+  overcurrentDetected = false;
+  overvoltageDetected = false;
+  sensorFaultDetected = false;
 }
 
-// ==================== SAFE OPERATION CHECK ====================
-bool isSafeToOperate() {
-  if (!sensorsValid) {
-    Serial.println(F("✗ Cannot enable: Sensors invalid"));
-    return false;
-  }
-  
-  if (currentState == STATE_ERROR) {
-    Serial.println(F("✗ Cannot enable: System in ERROR"));
-    Serial.println(F("  Type 'reset' first"));
-    return false;
-  }
-  
-  if (criticalError) {
-    Serial.println(F("✗ Cannot enable: Critical error present"));
-    return false;
-  }
-  
-  float avgVoltage = getAverageVoltage();
-  if (avgVoltage < MIN_VALID_VOLTAGE) {
-    Serial.println(F("✗ Cannot enable: No valid voltage detected"));
-    return false;
-  }
-  
-  return true;
-}
-
-// ==================== SERIAL COMMANDS (PROTECTED INPUT) ====================
 void handleSerialCommands() {
   static char cmdBuffer[MAX_CMD_LENGTH];
   static uint8_t cmdIndex = 0;
@@ -1187,211 +1778,164 @@ void handleSerialCommands() {
     if (c == '\n' || c == '\r') {
       if (cmdIndex > 0) {
         cmdBuffer[cmdIndex] = '\0';
-        
-        // Convert to lowercase
-        for (uint8_t i = 0; i < cmdIndex; i++) {
-          cmdBuffer[i] = tolower(cmdBuffer[i]);
-        }
-        
         processCommand(cmdBuffer);
         cmdIndex = 0;
       }
     } else if (cmdIndex < MAX_CMD_LENGTH - 1) {
       cmdBuffer[cmdIndex++] = c;
-    } else {
-      // Buffer overflow protection
-      Serial.println(F("✗ Command too long (max 64 chars)"));
-      cmdIndex = 0;
-      while (Serial.available()) Serial.read(); // Flush
     }
   }
 }
 
 void processCommand(const char* command) {
-  Serial.printf("\n> %s\n", command);
+  String cmd = String(command);
+  cmd.trim();
+  cmd.toLowerCase();
   
-  if (strcmp(command, "reset") == 0) {
-    emergencyReset();
-    return;
+  if (cmd == "help") {
+    printMenu();
   }
-  
-  if (strcmp(command, "restart") == 0) {
-    Serial.println(F("Restarting ESP32..."));
+  else if (cmd == "status") {
+    printDiagnostics();
+  }
+  else if (cmd == "stats") {
+    printStatistics();
+  }
+  else if (cmd == "calibrate") {
+    currentState = STATE_CALIBRATING;
+    calState = CAL_IDLE;
+    autoCalibrationInProgress = true;
+    Serial.println(F("Starting calibration..."));
+  }
+  else if (cmd == "calibrate_voltage") {
+    calibrateVoltageWithReference();
+  }
+  else if (cmd == "verify" || cmd == "verify_calibration") {
+    verifyCalibration();
+  }
+  else if (cmd == "on") {
+    if (!manualControl) {
+      Serial.println(F("Enable manual mode first"));
+      return;
+    }
+    digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
+    ssrEnabled = true;
+    ssrCommandState = true;
+    Serial.println(F("SSR: ON"));
+  }
+  else if (cmd == "off") {
+    if (!manualControl) {
+      Serial.println(F("Enable manual mode first"));
+      return;
+    }
+    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+    ssrEnabled = false;
+    ssrCommandState = false;
+    Serial.println(F("SSR: OFF"));
+  }
+  else if (cmd == "reset") {
+    Serial.println(F("Resetting system..."));
     delay(1000);
     ESP.restart();
   }
-  
-  // MODIFIED: "on" command now just ensures SSR is ON (normal state)
-  else if (strcmp(command, "on") == 0 || strcmp(command, "enable") == 0) {
-    if (isSafeToOperate()) {
-      ssrEnabled = true;
-      ssrCommandState = true;
-      digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
-      Serial.println(F("✓ SSR ON - Normal operation restored"));
-    }
+  else if (cmd == "manual") {
+    manualControl = !manualControl;
+    currentState = manualControl ? STATE_MANUAL_CONTROL : STATE_MONITORING;
+    Serial.printf("Manual mode: %s\n", manualControl ? "ON" : "OFF");
   }
-  // MODIFIED: "off" command now manually turns OFF (override normal behavior)
-  else if (strcmp(command, "off") == 0 || strcmp(command, "disable") == 0) {
-    ssrEnabled = false;
-    ssrCommandState = false;
-    digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
-    Serial.println(F("✓ SSR MANUALLY DISABLED"));
-    Serial.println(F("   (Use 'on' to restore normal operation)"));
+  else if (cmd == "safety") {
+    safetyEnabled = !safetyEnabled;
+    Serial.printf("Safety: %s\n", safetyEnabled ? "ON" : "OFF");
   }
-  else if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
-    printMenu();
+  else if (cmd == "buzzer") {
+    buzzerEnabled = !buzzerEnabled;
+    Serial.printf("Buzzer: %s\n", buzzerEnabled ? "ON" : "OFF");
   }
-  else if (strcmp(command, "status") == 0) {
-    updateDisplay();
-    printStatistics();
+  else if (cmd == "pir_on" || cmd == "pir_enable") {
+    enablePIR();
   }
-  else if (strcmp(command, "diag") == 0 || strcmp(command, "diagnostics") == 0) {
-    printDiagnostics();
+  else if (cmd == "pir_off" || cmd == "pir_disable") {
+    disablePIR();
   }
-  else if (strcmp(command, "mem") == 0 || strcmp(command, "memory") == 0) {
-    printMemoryUsage();
+  else if (cmd == "pir_status" || cmd == "pir") {
+    printPIRStatus();
   }
-  else if (strcmp(command, "test") == 0) {
-    Serial.println(F("\n=== SENSOR TEST ==="));
-    for (int i = 0; i < 3; i++) {
-      float currentVolt = readRawSensorVoltage(ACS712_PIN, ADC_SAMPLES_SLOW);
-      float voltageVolt = readRawSensorVoltage(ZMPT101B_PIN, ADC_SAMPLES_SLOW);
-      float current = calculateRMSCurrent();
-      float voltage = calculateRMSVoltage(ZMPT101B_PIN);
-      
-      Serial.printf("\nReading %d:\n", i+1);
-      Serial.printf("  ACS712 raw: %.3fV → Current: %.3fA\n", currentVolt, current);
-      Serial.printf("  ZMPT101B raw: %.3fV → Voltage: %.1fV\n", voltageVolt, voltage);
-      delay(500);
-      feedWatchdog();
-    }
-    Serial.printf("\nCalibration:\n");
-    Serial.printf("  Current offset: %.3fV\n", calData.currentOffset);
-    Serial.printf("  Voltage offset: %.3fV\n", calData.voltageOffset);
-    Serial.printf("  Current cal: %.3f\n", calData.currentCalibration);
-    Serial.printf("  Voltage cal: %.3f\n", calData.voltageCalibration);
-    Serial.println(F("===================\n"));
+  else if (cmd == "recovery" || cmd == "recover") {
+    Serial.println(F("Attempting recovery..."));
+    currentState = STATE_RECOVERY;
+    autoRecoveryAttempts = 0;
   }
-  else if (strcmp(command, "calibrate") == 0) {
-    Serial.println(F("Starting manual calibration..."));
-    currentState = STATE_CALIBRATING;
-    calState = CAL_CURRENT_SAMPLING;
-    calProgress.samplesCollected = 0;
-    calProgress.currentSum = 0.0;
-    calProgress.voltageSum = 0.0;
-    calProgress.startTime = millis();
-    lastCalibrationTime = millis();  // Reset auto-calibration timer
-    autoCalibrationInProgress = false;  // This is manual
-  }
-  else if (strcmp(command, "cal_voltage") == 0) {
-    calibrateVoltageWithReference();
-  }
-  else if (strcmp(command, "stats") == 0) {
-    printStatistics();
-  }
-  else if (strcmp(command, "clear") == 0) {
+  else if (cmd == "clear") {
     maxCurrent = 0.0;
     maxVoltage = 0.0;
     minVoltage = 999.0;
     maxPower = 0.0;
     energyConsumed = 0.0;
     shutdownCount = 0;
-    loopCount = 0;
-    systemStartTime = millis();
-    perfMetrics.maxLoopTime = 0;
-    perfMetrics.minLoopTime = 999999;
-    Serial.println(F("✓ Statistics cleared"));
+    Serial.println(F("Statistics cleared"));
   }
-  else if (strcmp(command, "manual") == 0) {
-    manualControl = !manualControl;
-    currentState = manualControl ? STATE_MANUAL_CONTROL : STATE_MONITORING;
-    Serial.printf("Manual mode: %s\n", manualControl ? "ON" : "OFF");
-    if (manualControl) {
-      Serial.println(F("⚠️  Safety checks disabled in manual mode"));
-    }
-  }
-  else if (strcmp(command, "safety") == 0) {
-    safetyEnabled = !safetyEnabled;
-    Serial.printf("Safety: %s\n", safetyEnabled ? "ON" : "OFF");
-  }
-  else if (strcmp(command, "buzzer") == 0) {
-    buzzerEnabled = !buzzerEnabled;
-    Serial.printf("Buzzer: %s\n", buzzerEnabled ? "ON" : "OFF");
-  }
-  else if (strncmp(command, "power_factor ", 13) == 0) {
-    float pf = atof(command + 13);
-    if (pf >= 0.1 && pf <= 1.0) {
+  else if (cmd.startsWith("power_factor ")) {
+    float pf = cmd.substring(13).toFloat();
+    if (pf > 0 && pf <= 1.0) {
       calData.powerFactor = pf;
+      powerFactor = pf;
       saveCalibrationData();
-      Serial.printf("✓ Power factor: %.2f\n", pf);
+      Serial.printf("Power factor: %.2f\n", pf);
     } else {
-      Serial.println(F("✗ Invalid (0.1-1.0)"));
+      Serial.println(F("Invalid power factor (0-1.0)"));
     }
   }
-  else if (strncmp(command, "current_cal ", 12) == 0) {
-    float cal = atof(command + 12);
-    if (cal > 0.001 && cal < 100.0) {
-      calData.currentCalibration = cal;
-      saveCalibrationData();
-      Serial.printf("✓ Current cal: %.3f\n", cal);
-    } else {
-      Serial.println(F("✗ Invalid (0.001-100.0)"));
-    }
+  else if (cmd == "test_buzzer") {
+    testBuzzer();
   }
-  else if (strncmp(command, "voltage_cal ", 12) == 0) {
-    float cal = atof(command + 12);
-    if (cal > 0.01 && cal < 1000.0) {
-      calData.voltageCalibration = cal;
-      saveCalibrationData();
-      Serial.printf("✓ Voltage cal: %.3f\n", cal);
-    } else {
-      Serial.println(F("✗ Invalid (0.01-1000.0)"));
-    }
+  else if (cmd == "mem" || cmd == "memory") {
+    printMemoryUsage();
+  }
+  else if (cmd == "reset_calibration") {
+    Serial.println(F("\n*** RESETTING CALIBRATION TO DEFAULTS ***"));
+    calData.voltageCalibration = 1.0;
+    calData.currentCalibration = 1.0;
+    saveCalibrationData();
+    Serial.println(F("✓ Calibration reset complete"));
+    Serial.println(F("Run 'calibrate_voltage' to recalibrate\n"));
   }
   else {
-    Serial.println(F("✗ Unknown command"));
-    Serial.println(F("Type 'help' for commands"));
+    Serial.println(F("Unknown command. Type 'help'"));
   }
 }
 
-// ==================== MENU ====================
 void printMenu() {
   Serial.println(F("\n========================================"));
-  Serial.println(F("    COMMAND MENU"));
+  Serial.println(F("    VAULTER v5.3 COMMANDS"));
   Serial.println(F("========================================"));
-  Serial.println(F("NOTE: SSR is NORMALLY ON"));
-  Serial.println(F("      Turns OFF only during anomalies"));
-  Serial.println(F("      Auto-calibrates every 2 minutes"));
-  Serial.println(F("========================================"));
-  Serial.println(F("EMERGENCY:"));
-  Serial.println(F("  reset         - Emergency reset"));
-  Serial.println(F("  restart       - Restart ESP32"));
+  Serial.println(F("STATUS:"));
+  Serial.println(F("  help     - Show commands"));
+  Serial.println(F("  status   - Show diagnostics"));
+  Serial.println(F("  stats    - Show statistics"));
+  Serial.println(F("  mem      - Memory usage"));
   Serial.println();
-  Serial.println(F("BASIC:"));
-  Serial.println(F("  help          - Show this menu"));
-  Serial.println(F("  status        - Show status"));
-  Serial.println(F("  test          - Test sensors"));
-  Serial.println(F("  on            - Ensure SSR ON (normal)"));
-  Serial.println(F("  off           - Force SSR OFF (manual)"));
+  Serial.println(F("CONTROL:"));
+  Serial.println(F("  on       - Turn on SSR"));
+  Serial.println(F("  off      - Turn off SSR"));
+  Serial.println(F("  reset    - Restart system"));
   Serial.println();
-  Serial.println(F("DIAGNOSTICS:"));
-  Serial.println(F("  diag          - Full diagnostics"));
-  Serial.println(F("  mem           - Memory usage"));
-  Serial.println(F("  stats         - Statistics"));
+  Serial.println(F("PIR:"));
+  Serial.println(F("  pir_on   - Enable PIR"));
+  Serial.println(F("  pir_off  - Disable PIR"));
+  Serial.println(F("  pir      - PIR status"));
   Serial.println();
-  Serial.println(F("CALIBRATION:"));
-  Serial.println(F("  calibrate     - Manual calibrate now"));
-  Serial.println(F("                  (Auto every 2 min)"));
-  Serial.println(F("  cal_voltage   - Voltage wizard"));
-  Serial.println(F("  voltage_cal X - Set factor (0.01-1000)"));
-  Serial.println(F("  current_cal X - Set factor (0.001-100)"));
+  Serial.println(F("CALIBRATION (v5.3 FIXES):"));
+  Serial.println(F("  calibrate         - Auto calibration"));
+  Serial.println(F("  calibrate_voltage - Manual voltage cal"));
+  Serial.println(F("  verify            - Check calibration"));
+  Serial.println(F("  reset_calibration - Reset to defaults"));
   Serial.println();
   Serial.println(F("SETTINGS:"));
-  Serial.println(F("  manual        - Toggle manual mode"));
-  Serial.println(F("  safety        - Toggle safety"));
-  Serial.println(F("  buzzer        - Toggle buzzer"));
-  Serial.println(F("  power_factor X- Set power factor"));
-  Serial.println(F("  clear         - Clear statistics"));
+  Serial.println(F("  manual       - Toggle manual"));
+  Serial.println(F("  safety       - Toggle safety"));
+  Serial.println(F("  buzzer       - Toggle buzzer"));
+  Serial.println(F("  power_factor - Set power factor"));
+  Serial.println(F("  clear        - Clear stats"));
   Serial.println(F("========================================\n"));
 }
 
@@ -1399,241 +1943,191 @@ void printStatistics() {
   Serial.println(F("\n=== STATISTICS ==="));
   unsigned long uptime = (millis() - systemStartTime) / 1000;
   Serial.printf("Uptime: %02lu:%02lu:%02lu\n", uptime/3600, (uptime%3600)/60, uptime%60);
-  Serial.printf("Loop count: %lu\n", loopCount);
+  Serial.printf("Loops: %lu\n", loopCount);
   Serial.printf("Energy: %.3f Wh (%.2f kWh)\n", energyConsumed, energyConsumed / 1000.0);
-  Serial.printf("Max Current: %.3f A\n", maxCurrent);
-  Serial.printf("Max Voltage: %.1f V\n", maxVoltage);
-  Serial.printf("Min Voltage: %.1f V\n", minVoltage);
-  Serial.printf("Max Power: %.1f W\n", maxPower);
+  Serial.printf("Max I: %.3f A\n", maxCurrent);
+  Serial.printf("Max V: %.1f V\n", maxVoltage);
+  Serial.printf("Min V: %.1f V\n", minVoltage);
+  Serial.printf("Max P: %.1f W\n", maxPower);
   Serial.printf("Shutdowns: %lu\n", shutdownCount);
+  Serial.printf("PIR triggers: %d\n", pirTriggerCount);
+  Serial.printf("Recovery attempts: %d\n", autoRecoveryAttempts);
   Serial.printf("Sensors: %s\n", sensorsValid ? "Valid" : "Invalid");
-  Serial.printf("Safety: %s\n", safetyEnabled ? "Enabled" : "Disabled");
-  Serial.printf("Manual: %s\n", manualControl ? "Yes" : "No");
   Serial.println(F("==================\n"));
 }
 
-// ==================== DIAGNOSTICS ====================
 void printDiagnostics() {
   Serial.println(F("\n========================================"));
-  Serial.println(F("    SYSTEM DIAGNOSTICS"));
+  Serial.println(F("    DIAGNOSTICS"));
   Serial.println(F("========================================"));
   
-  Serial.println(F("\n--- SYSTEM INFO ---"));
-  Serial.printf("Version: v4.0 Enhanced (SSR Normally ON + Auto-Cal)\n");
-  Serial.printf("Chip Model: %s\n", ESP.getChipModel());
-  Serial.printf("Chip Revision: %d\n", ESP.getChipRevision());
-  Serial.printf("CPU Freq: %d MHz\n", ESP.getCpuFreqMHz());
-  Serial.printf("Flash Size: %d bytes\n", ESP.getFlashChipSize());
+  Serial.println(F("\n--- SYSTEM ---"));
+  Serial.printf("Version: v5.3 Philippines Fixed + Voltage Corrected\n");
+  Serial.printf("Chip: %s Rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
+  Serial.printf("CPU: %d MHz\n", ESP.getCpuFreqMHz());
   
   printMemoryUsage();
   
-  Serial.println(F("\n--- SENSOR STATUS ---"));
-  Serial.printf("Sensors Valid: %s\n", sensorsValid ? "YES" : "NO");
-  Serial.printf("Current Reading: %.3f A\n", currentReading);
-  Serial.printf("Voltage Reading: %.1f V\n", voltageReading);
-  Serial.printf("Power Reading: %.1f W\n", powerReading);
-  Serial.printf("Current Avg: %.3f A\n", getAverageCurrent());
-  Serial.printf("Voltage Avg: %.1f V\n", getAverageVoltage());
+  Serial.println(F("\n--- ELECTRICAL STANDARDS ---"));
+  Serial.printf("Nominal Voltage: %.0fV\n", NOMINAL_VOLTAGE);
+  Serial.printf("Frequency: %dHz\n", AC_FREQUENCY);
+  Serial.printf("Voltage Range: %.0f-%.0fV\n", MIN_VOLTAGE, MAX_VOLTAGE);
   
-  Serial.println(F("\n--- CALIBRATION ---"));
-  Serial.printf("Current Offset: %.3f V\n", calData.currentOffset);
-  Serial.printf("Voltage Offset: %.3f V\n", calData.voltageOffset);
-  Serial.printf("Current Cal: %.3f\n", calData.currentCalibration);
-  Serial.printf("Voltage Cal: %.3f\n", calData.voltageCalibration);
-  Serial.printf("Power Factor: %.2f\n", calData.powerFactor);
-  Serial.printf("EEPROM Valid: %s\n", (calData.magic == EEPROM_MAGIC) ? "YES" : "NO");
+  Serial.println(F("\n--- SENSORS ---"));
+  Serial.printf("Valid: %s\n", sensorsValid ? "YES" : "NO");
+  Serial.printf("Current: %.3f A (Avg: %.3f)\n", currentReading, getAverageCurrent());
+  Serial.printf("Voltage: %.1f V (Avg: %.1f)\n", voltageReading, getAverageVoltage());
+  Serial.printf("Power: %.1f W\n", powerReading);
+  Serial.printf("Voltage errors: %d\n", voltageErrorCount);
   
-  // Show calibration timing
-  unsigned long timeSinceLastCal = (millis() - lastCalibrationTime) / 1000;
-  unsigned long timeUntilNextCal = (CALIBRATION_INTERVAL_MS - (millis() - lastCalibrationTime)) / 1000;
-  if (timeUntilNextCal > 1000000) timeUntilNextCal = 0; // Handle wraparound
-  Serial.printf("Last Calibration: %lu seconds ago\n", timeSinceLastCal);
-  Serial.printf("Next Calibration: in %lu seconds\n", timeUntilNextCal);
-  Serial.printf("Auto-Calibration: Every %d minutes\n", CALIBRATION_INTERVAL_MS / 60000);
+  Serial.println(F("\n--- PIR ---"));
+  Serial.printf("Enabled: %s\n", pirEnabled ? "YES" : "NO");
+  Serial.printf("State: %s\n", getPIRStateString().c_str());
+  Serial.printf("Load: %s\n", loadDetected ? "YES" : "NO");
+  Serial.printf("Triggers: %d\n", pirTriggerCount);
+  Serial.printf("Check Interval: %dms\n", PIR_CHECK_INTERVAL);
+  Serial.printf("Debounce: %dms\n", PIR_DEBOUNCE_TIME);
+  Serial.printf("Load Threshold: %.2fA\n", LOAD_DETECTION_THRESHOLD);
   
-  Serial.println(F("\n--- SAFETY STATUS ---"));
-  Serial.printf("Safety Enabled: %s\n", safetyEnabled ? "YES" : "NO");
-  Serial.printf("Manual Control: %s\n", manualControl ? "YES" : "NO");
-  Serial.printf("Overcurrent: %s\n", overcurrentDetected ? "DETECTED" : "OK");
-  Serial.printf("Overvoltage: %s\n", overvoltageDetected ? "DETECTED" : "OK");
-  Serial.printf("Undervoltage: %s\n", undervoltageDetected ? "DETECTED" : "OK");
-  Serial.printf("Brown-out: %s\n", brownoutDetected ? "DETECTED" : "OK");
-  Serial.printf("Sensor Fault: %s\n", sensorFaultDetected ? "DETECTED" : "OK");
+  Serial.println(F("\n--- CALIBRATION (v5.3) ---"));
+  Serial.printf("Current offset: %.3f V\n", calData.currentOffset);
+  Serial.printf("Voltage offset: %.3f V\n", calData.voltageOffset);
+  Serial.printf("Current cal: %.3f (Max: %.1f)\n", calData.currentCalibration, MAX_CURRENT_CALIBRATION);
+  Serial.printf("Voltage cal: %.3f (Max: %.1f)\n", calData.voltageCalibration, MAX_VOLTAGE_CALIBRATION);
+  Serial.printf("Power factor: %.2f\n", calData.powerFactor);
+  Serial.printf("ZMPT Sensitivity: %.4f V/V (FIXED)\n", ZMPT101B_SENSITIVITY);
   
-  Serial.println(F("\n--- SSR STATUS ---"));
-  Serial.printf("SSR Enabled: %s (Should be ON normally)\n", ssrEnabled ? "YES" : "NO");
-  Serial.printf("SSR Command State: %s\n", ssrCommandState ? "ON" : "OFF");
-  Serial.printf("SSR Pin State: %s\n", digitalRead(SSR_CONTROL_PIN) == SSR_ON_STATE ? "ON" : "OFF");
+  Serial.println(F("\n--- SAFETY ---"));
+  Serial.printf("Enabled: %s\n", safetyEnabled ? "YES" : "NO");
+  Serial.printf("Manual: %s\n", manualControl ? "YES" : "NO");
+  Serial.printf("Overcurrent: %s\n", overcurrentDetected ? "YES" : "NO");
+  Serial.printf("Overvoltage: %s\n", overvoltageDetected ? "YES" : "NO");
+  Serial.printf("Sensor fault: %s\n", sensorFaultDetected ? "YES" : "NO");
+  
+  Serial.println(F("\n--- SSR ---"));
+  Serial.printf("Enabled: %s\n", ssrEnabled ? "YES" : "NO");
+  Serial.printf("Command: %s\n", ssrCommandState ? "ON" : "OFF");
+  
+  Serial.println(F("\n--- NETWORK ---"));
+  Serial.printf("WiFi: %s\n", wifiConnected ? "YES" : "NO");
+  if (wifiConnected) {
+    Serial.print(F("IP: "));
+    Serial.println(WiFi.localIP());
+    Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
+  }
+  Serial.printf("Server: %s\n", serverConnected ? "YES" : "NO");
+  Serial.printf("WebSocket: %s\n", wsConnected ? "YES" : "NO");
+  Serial.printf("Host: %s\n", SERVER_HOST);
+  Serial.printf("Device: %s\n", DEVICE_ID);
+  
+  int totalRequests = serverSuccessCount + serverErrorCount;
+  float successRate = totalRequests > 0 ? (float)serverSuccessCount / totalRequests * 100.0 : 0;
+  Serial.printf("\nServer Stats:\n");
+  Serial.printf("  Success: %d\n", serverSuccessCount);
+  Serial.printf("  Errors: %d\n", serverErrorCount);
+  Serial.printf("  Rate: %.1f%%\n", successRate);
   
   Serial.println(F("\n--- PERFORMANCE ---"));
   if (perfMetrics.avgLoopTime > 0) {
-    Serial.printf("Avg Loop Time: %lu ms\n", perfMetrics.avgLoopTime);
-    Serial.printf("Min Loop Time: %lu ms\n", perfMetrics.minLoopTime);
-    Serial.printf("Max Loop Time: %lu ms\n", perfMetrics.maxLoopTime);
-    float loopsPerSec = perfMetrics.avgLoopTime > 0 ? 1000.0 / perfMetrics.avgLoopTime : 0;
-    Serial.printf("Loops/Second: %.1f\n", loopsPerSec);
+    Serial.printf("Avg: %lu ms\n", perfMetrics.avgLoopTime);
+    Serial.printf("Min: %lu ms\n", perfMetrics.minLoopTime);
+    Serial.printf("Max: %lu ms\n", perfMetrics.maxLoopTime);
   }
-  
-  Serial.println(F("\n--- PERIPHERALS ---"));
-  Serial.printf("SD Card: %s\n", sdCardAvailable ? "Available" : "Not Available");
-  Serial.printf("Buzzer: %s\n", buzzerEnabled ? "Enabled" : "Disabled");
-  
-  Serial.println(F("\n--- NETWORK ---"));
-  Serial.printf("WiFi Enabled: %s\n", wifiEnabled ? "YES" : "NO");
-  Serial.printf("WiFi Connected: %s\n", wifiConnected ? "YES" : "NO");
-  if (wifiConnected) {
-    Serial.print(F("IP Address: "));
-    Serial.println(WiFi.localIP());
-    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
-  }
-  Serial.printf("Server Connected: %s\n", serverConnected ? "YES" : "NO");
-  Serial.printf("Server URL: %s\n", SERVER_URL);
-  Serial.printf("Device ID: %s\n", DEVICE_ID);
   
   Serial.println(F("\n========================================\n"));
 }
 
-// ==================== MEMORY USAGE ====================
 void printMemoryUsage() {
-  Serial.println(F("\n--- MEMORY USAGE ---"));
-  Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Heap Size: %d bytes\n", ESP.getHeapSize());
-  Serial.printf("Min Free Heap: %d bytes\n", ESP.getMinFreeHeap());
-  Serial.printf("Max Alloc Heap: %d bytes\n", ESP.getMaxAllocHeap());
+  Serial.println(F("\n--- MEMORY ---"));
+  Serial.printf("Free: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Size: %d bytes\n", ESP.getHeapSize());
+  Serial.printf("Min free: %d bytes\n", ESP.getMinFreeHeap());
   
-  float heapUsagePercent = 100.0 * (1.0 - (float)ESP.getFreeHeap() / ESP.getHeapSize());
-  Serial.printf("Heap Usage: %.1f%%\n", heapUsagePercent);
+  float usage = 100.0 * (1.0 - (float)ESP.getFreeHeap() / ESP.getHeapSize());
+  Serial.printf("Usage: %.1f%%\n", usage);
   
-  if (heapUsagePercent > 80.0) {
-    Serial.println(F("⚠️  WARNING: High memory usage!"));
-  }
+  if (usage > 80.0) Serial.println(F("WARNING: High memory"));
 }
 
-// ==================== CRC32 CALCULATION ====================
 uint32_t calculateCRC32(const uint8_t* data, size_t length) {
   uint32_t crc = 0xFFFFFFFF;
-  
   for (size_t i = 0; i < length; i++) {
     crc ^= data[i];
     for (int j = 0; j < 8; j++) {
       crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
     }
   }
-  
   return ~crc;
 }
 
-// ==================== EEPROM WITH CRC ====================
 void saveCalibrationData() {
   calData.magic = EEPROM_MAGIC;
-  
-  // Calculate CRC (exclude CRC field itself)
   calData.crc = calculateCRC32((uint8_t*)&calData, sizeof(CalibrationData) - sizeof(uint32_t));
-  
-  // Write to EEPROM
   EEPROM.put(0, calData);
   EEPROM.commit();
-  
-  Serial.println(F("✓ Saved to EEPROM (with CRC)"));
+  Serial.println(F("Saved to EEPROM"));
 }
 
 bool loadCalibrationData() {
   CalibrationData loadedData;
   EEPROM.get(0, loadedData);
   
-  // Check magic number
   if (loadedData.magic != EEPROM_MAGIC) {
-    Serial.println(F("⚠️  EEPROM: Invalid magic number"));
+    Serial.println(F("EEPROM: Invalid magic"));
     return false;
   }
   
-  // Verify CRC
   uint32_t calculatedCRC = calculateCRC32((uint8_t*)&loadedData, sizeof(CalibrationData) - sizeof(uint32_t));
   if (calculatedCRC != loadedData.crc) {
-    Serial.println(F("⚠️  EEPROM: CRC mismatch (data corrupted)"));
+    Serial.println(F("EEPROM: CRC mismatch"));
     return false;
   }
   
-  // Validate ranges
-  if (isnan(loadedData.currentOffset) || loadedData.currentOffset < 0.5 || loadedData.currentOffset > 3.0) {
-    Serial.println(F("⚠️  EEPROM: Invalid current offset"));
+  if (isnan(loadedData.currentOffset) || loadedData.currentOffset < 0.5 || loadedData.currentOffset > 3.0 ||
+      isnan(loadedData.voltageOffset) || loadedData.voltageOffset < 0.5 || loadedData.voltageOffset > 3.0 ||
+      isnan(loadedData.currentCalibration) || loadedData.currentCalibration <= 0 || loadedData.currentCalibration > 100.0 ||
+      isnan(loadedData.voltageCalibration) || loadedData.voltageCalibration <= 0 || loadedData.voltageCalibration > 1000.0 ||
+      isnan(loadedData.powerFactor) || loadedData.powerFactor <= 0 || loadedData.powerFactor > 1.0) {
+    Serial.println(F("EEPROM: Invalid data"));
     return false;
   }
   
-  if (isnan(loadedData.voltageOffset) || loadedData.voltageOffset < 0.5 || loadedData.voltageOffset > 3.0) {
-    Serial.println(F("⚠️  EEPROM: Invalid voltage offset"));
-    return false;
-  }
-  
-  if (isnan(loadedData.currentCalibration) || loadedData.currentCalibration <= 0 || loadedData.currentCalibration > 100.0) {
-    Serial.println(F("⚠️  EEPROM: Invalid current calibration"));
-    return false;
-  }
-  
-  if (isnan(loadedData.voltageCalibration) || loadedData.voltageCalibration <= 0 || loadedData.voltageCalibration > 1000.0) {
-    Serial.println(F("⚠️  EEPROM: Invalid voltage calibration"));
-    return false;
-  }
-  
-  if (isnan(loadedData.powerFactor) || loadedData.powerFactor <= 0 || loadedData.powerFactor > 1.0) {
-    Serial.println(F("⚠️  EEPROM: Invalid power factor"));
-    return false;
-  }
-  
-  // All checks passed - load data
   calData = loadedData;
-  Serial.println(F("✓ Loaded calibration from EEPROM (CRC verified)"));
+  Serial.println(F("Loaded from EEPROM"));
   return true;
 }
 
-// ==================== SD CARD ====================
 void initSDCard() {
-  Serial.print(F("Initializing SD card... "));
-  
+  Serial.print(F("SD card: "));
   if (!SD.begin(SD_CS_PIN)) {
-    Serial.println(F("FAILED"));
+    Serial.println(F("FAIL"));
     sdCardAvailable = false;
     return;
   }
   
   sdCardAvailable = true;
-  Serial.println(F("✓ SD card ready"));
+  Serial.println(F("OK"));
   
-  // Write header if file doesn't exist
   if (!SD.exists("/datalog.csv")) {
     File file = SD.open("/datalog.csv", FILE_WRITE);
     if (file) {
-      file.println("Timestamp,Voltage,Current,Power,SSR_State");
+      file.println("Time,V,I,P,SSR,PIR,Load,State");
       file.close();
-      Serial.println(F("  Created datalog.csv with header"));
+      Serial.println(F("Created datalog.csv"));
     }
   }
 }
 
 void logToSD(const char* data) {
   if (!sdCardAvailable) return;
-  
   File file = SD.open("/datalog.csv", FILE_APPEND);
-  if (!file) {
-    static unsigned long lastError = 0;
-    if (millis() - lastError > 10000) {
-      Serial.println(F("⚠️  SD write failed"));
-      lastError = millis();
-    }
-    return;
-  }
-  
+  if (!file) return;
   file.println(data);
   file.close();
 }
 
-// ==================== BUZZER TEST ====================
 void testBuzzer() {
-  if (!buzzerEnabled) {
-    Serial.println(F("Buzzer disabled"));
-    return;
-  }
-  Serial.println(F("Testing buzzer..."));
+  if (!buzzerEnabled) return;
   for (int i = 0; i < 3; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
     delay(200);
@@ -1641,154 +2135,12 @@ void testBuzzer() {
     delay(200);
     feedWatchdog();
   }
-  Serial.println(F("✓ Buzzer OK"));
 }
 
-// ==================== WIFI FUNCTIONS ====================
-void connectToWiFi() {
-  Serial.print(F("Connecting to WiFi: "));
-  Serial.println(WIFI_SSID);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  unsigned long startAttempt = millis();
-  
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS) {
-    delay(500);
-    Serial.print(F("."));
-    feedWatchdog();
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    wifiEnabled = true;
-    Serial.println();
-    Serial.println(F("✓ WiFi connected!"));
-    Serial.print(F("  IP Address: "));
-    Serial.println(WiFi.localIP());
-    Serial.print(F("  Signal: "));
-    Serial.print(WiFi.RSSI());
-    Serial.println(F(" dBm"));
-    Serial.print(F("  Device ID: "));
-    Serial.println(DEVICE_ID);
-    Serial.print(F("  Server URL: "));
-    Serial.println(SERVER_URL);
-  } else {
-    wifiConnected = false;
-    wifiEnabled = false;
-    Serial.println();
-    Serial.println(F("⚠️  WiFi connection failed!"));
-    Serial.println(F("   System will continue without WiFi"));
-    Serial.println(F("   WiFi reconnection will be attempted periodically"));
-  }
-  
-  Serial.println();
-}
-
-void checkWiFiConnection() {
-  if (!wifiEnabled) return;
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    if (wifiConnected) {
-      Serial.println(F("⚠️  WiFi connection lost! Attempting reconnection..."));
-      wifiConnected = false;
-      serverConnected = false;
-    }
-    
-    WiFi.disconnect();
-    WiFi.reconnect();
-    
-    unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000) {
-      delay(250);
-      feedWatchdog();
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      Serial.println(F("✓ WiFi reconnected!"));
-      Serial.print(F("  IP: "));
-      Serial.println(WiFi.localIP());
-    }
-  } else if (!wifiConnected) {
-    wifiConnected = true;
-    Serial.println(F("✓ WiFi connection restored"));
-  }
-}
-
-// ==================== SERVER COMMUNICATION ====================
-void sendDataToServer() {
-  if (!wifiConnected || !sensorsValid) return;
-  
-  // Create JSON data
-  StaticJsonDocument<512> doc;
-  doc["deviceId"] = DEVICE_ID;
-  doc["voltage"] = voltageReading;
-  doc["current"] = currentReading;
-  doc["power"] = powerReading;
-  doc["energy"] = energyConsumed;
-  doc["ssrState"] = ssrEnabled;
-  doc["state"] = getStateString().c_str();
-  doc["sensors"] = sensorsValid ? "valid" : "invalid";
-  
-  char jsonBuffer[512];
-  serializeJson(doc, jsonBuffer);
-  
-  // Send to server
-  bool success = sendHTTPRequest("/api/data", jsonBuffer);
-  
-  if (success && !serverConnected) {
-    serverConnected = true;
-    Serial.println(F("✓ Server connection established"));
-  } else if (!success && serverConnected) {
-    serverConnected = false;
-    Serial.println(F("⚠️  Server connection lost"));
-  }
-}
-
-bool sendHTTPRequest(const char* endpoint, const char* jsonData) {
-  HTTPClient http;
-  
-  // Build full URL
-  String url = String(SERVER_URL) + String(endpoint);
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);  // 5 second timeout
-  
-  int httpResponseCode = http.POST(jsonData);
-  
-  bool success = false;
-  
-  if (httpResponseCode > 0) {
-    if (httpResponseCode == 200) {
-      success = true;
-      
-      // Optional: process response
-      String response = http.getString();
-      
-      // Only log successful connections occasionally to reduce spam
-      static unsigned long lastSuccessLog = 0;
-      if (millis() - lastSuccessLog > 60000) {  // Log once per minute
-        Serial.println(F("✓ Data sent to server"));
-        lastSuccessLog = millis();
-      }
-    } else {
-      static unsigned long lastErrorLog = 0;
-      if (millis() - lastErrorLog > 10000) {  // Log errors every 10 seconds
-        Serial.printf("⚠️  Server error: %d\n", httpResponseCode);
-        lastErrorLog = millis();
-      }
-    }
-  } else {
-    static unsigned long lastFailLog = 0;
-    if (millis() - lastFailLog > 10000) {  // Log failures every 10 seconds
-      Serial.printf("✗ HTTP request failed: %s\n", http.errorToString(httpResponseCode).c_str());
-      lastFailLog = millis();
-    }
-  }
-  
-  http.end();
-  return success;
+void emergencyReset() {
+  Serial.println(F("\nEMERGENCY RESET"));
+  digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+  ssrEnabled = false;
+  delay(2000);
+  ESP.restart();
 }
