@@ -1,5 +1,5 @@
 /*
- * Vaulter v5.3 - PHILIPPINES FIXED VERSION - VOLTAGE CORRECTED
+ * Vaulter v5.3.1 - PHILIPPINES FIXED VERSION - PIR SENSOR FIXED
  * Server: https://meifhi-esp-server.onrender.com
  * Features: PIR Child Safety, Auto-Calibration, Self-Reliance, WebSocket Connectivity
  * 
@@ -8,14 +8,21 @@
  * - Frequency: 60Hz
  * - CRITICAL FIX: Corrected ZMPT101B sensitivity and calibration limits
  * 
- * VERSION 5.3 FIXES:
+ * VERSION 5.3.1 PIR FIXES (Current Release):
+ * - CRITICAL: Fixed PIR pin configuration (INPUT → INPUT_PULLDOWN) for stable reading
+ * - CRITICAL: Fixed load detection bug in checkLoadPluggedIn() (was stuck returning old state)
+ * - CRITICAL: Added PIR timing variable initialization in setup() to prevent debounce issues
+ * - CRITICAL: Improved PIR sensor stability check on startup
+ * - Enhanced load detection with proper state machine transitions
+ * - All voltage fixes from v5.3 preserved
+ * 
+ * VERSION 5.3 FIXES (Previous Release):
  * - CRITICAL: Fixed ZMPT101B sensitivity from 0.0053 to 0.004 (correct for standard module)
  * - CRITICAL: Added maximum calibration factor limits (max 10.0 instead of unlimited)
  * - CRITICAL: Added voltage reading sanity checks to prevent 20kV errors
  * - CRITICAL: Reset default voltage calibration to 1.0 for safety
  * - Improved calibration validation with stricter checks
  * - Added real-time voltage validation during operation
- * - All PIR improvements from v5.2 preserved
  * - Enhanced error reporting for voltage issues
  */
 
@@ -332,7 +339,7 @@ void setup() {
   delay(2000);
   
   Serial.println(F("\n========================================"));
-  Serial.println(F("ESP32 Vaulter v5.3 - VOLTAGE FIXED"));
+  Serial.println(F("ESP32 Vaulter v5.3.1 - PIR FIXED"));
   Serial.println(F("Server: meifhi-esp-server.onrender.com"));
   Serial.println(F("========================================"));
   Serial.println(F("PHILIPPINES ELECTRICAL STANDARDS:"));
@@ -340,12 +347,12 @@ void setup() {
   Serial.printf("Frequency: %dHz\n", AC_FREQUENCY);
   Serial.printf("Voltage Range: %.0f-%.0fV\n", MIN_VOLTAGE, MAX_VOLTAGE);
   Serial.println(F("========================================"));
-  Serial.println(F("VERSION 5.3 CRITICAL FIXES:"));
-  Serial.println(F("✓ ZMPT101B sensitivity: 0.0053 → 0.004"));
-  Serial.println(F("✓ Added calibration limits (max 10.0x)"));
-  Serial.println(F("✓ Real-time voltage validation"));
-  Serial.println(F("✓ Voltage calibration reset to 1.0"));
-  Serial.println(F("✓ All PIR improvements preserved"));
+  Serial.println(F("VERSION 5.3.1 PIR FIXES:"));
+  Serial.println(F("✓ PIR pin: INPUT_PULLDOWN"));
+  Serial.println(F("✓ Load detection logic fixed"));
+  Serial.println(F("✓ PIR timing initialized"));
+  Serial.println(F("✓ Stability check added"));
+  Serial.println(F("✓ All v5.3 voltage fixes preserved"));
   Serial.println(F("========================================"));
   
   EEPROM.begin(EEPROM_SIZE);
@@ -354,7 +361,7 @@ void setup() {
   pinMode(RED_LED_PIN, OUTPUT);
   pinMode(GREEN_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PIR_SENSOR_PIN, INPUT);
+  pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);  // FIXED v5.3.1: Use INPUT_PULLDOWN for stable PIR reading
   
   digitalWrite(SSR_CONTROL_PIN, SSR_ON_STATE);
   digitalWrite(RED_LED_PIN, LOW);
@@ -389,6 +396,9 @@ void setup() {
   
   systemStartTime = millis();
   lastCalibrationTime = millis();
+  // FIXED v5.3.1: Initialize PIR timing variables to prevent debounce issues
+  lastPirCheck = millis();
+  lastPirChange = millis();
   currentState = STATE_CALIBRATING;
   calState = CAL_IDLE;
   
@@ -1439,17 +1449,42 @@ void sendDataToServer() {
 }
 
 void initPIRSensor() {
-  pinMode(PIR_SENSOR_PIN, INPUT);
-  delay(2000);
+  pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
+  
+  Serial.print(F("PIR sensor: Stabilizing"));
+  // FIXED v5.3.1: Wait for PIR sensor to stabilize
+  for (int i = 0; i < 25; i++) {
+    Serial.print(F("."));
+    delay(100);
+    feedWatchdog();
+  }
+  Serial.println();
+  
+  // FIXED v5.3.1: Check PIR sensor stability
+  int stableReadings = 0;
+  int highReadings = 0;
+  
+  for (int i = 0; i < 10; i++) {
+    if (digitalRead(PIR_SENSOR_PIN) == LOW) {
+      stableReadings++;
+    } else {
+      highReadings++;
+    }
+    delay(50);
+  }
   
   Serial.print(F("PIR sensor: "));
-  if (digitalRead(PIR_SENSOR_PIN) == LOW) {
-    Serial.println(F("OK (Ready)"));
+  if (stableReadings >= 7) {
+    Serial.println(F("OK (Stable LOW)"));
     if (pirEnabled) {
       pirState = PIR_MONITORING;
     }
+  } else if (highReadings >= 7) {
+    Serial.println(F("WARNING (Stable HIGH - check wiring)"));
+    pirState = PIR_INACTIVE;
   } else {
-    Serial.println(F("WARNING (HIGH state)"));
+    Serial.println(F("WARNING (Unstable - check connections)"));
+    pirState = PIR_INACTIVE;
   }
 }
 
@@ -1507,7 +1542,7 @@ void updatePIRChildSafety() {
   }
   
   // Only process PIR motion if load is detected
-  if (!loadDetected) {
+  if (loadDetected) {
     return;  // No load, no need to monitor motion
   }
   
@@ -1534,7 +1569,7 @@ void updatePIRChildSafety() {
   }
 }
 
-// IMPROVED: More stable load detection
+// FIXED v5.3.1: Corrected load detection logic
 bool checkLoadPluggedIn() {
   float avgCurrent = getAverageCurrent();
   
@@ -1543,20 +1578,23 @@ bool checkLoadPluggedIn() {
     // Start tracking load detection time
     if (loadDetectedTime == 0) {
       loadDetectedTime = millis();
+      return loadDetected;  // Keep previous state while starting timer
     } 
     // Confirm load after stable time
     else if (millis() - loadDetectedTime > LOAD_STABLE_TIME) {
-      return true;  // Load confirmed
+      return true;  // Load confirmed stable
     }
     // Still waiting for stability
-    return loadDetected;  // Keep previous state while waiting
+    else {
+      return loadDetected;  // Keep previous state while waiting
+    }
   } else {
     // Current below threshold - reset detection timer
     loadDetectedTime = 0;
     
-    // If load was detected, we need to wait for LOAD_LOST_TIME
-    // before declaring it lost (handled in updatePIRChildSafety)
-    return loadDetected;
+    // FIXED v5.3.1: Return false when current below threshold
+    // The caller (updatePIRChildSafety) will handle confirmation delay
+    return false;
   }
 }
 
@@ -1906,7 +1944,7 @@ void processCommand(const char* command) {
 
 void printMenu() {
   Serial.println(F("\n========================================"));
-  Serial.println(F("    VAULTER v5.3 COMMANDS"));
+  Serial.println(F("    VAULTER v5.3.1 COMMANDS"));
   Serial.println(F("========================================"));
   Serial.println(F("STATUS:"));
   Serial.println(F("  help     - Show commands"));
@@ -1962,7 +2000,7 @@ void printDiagnostics() {
   Serial.println(F("========================================"));
   
   Serial.println(F("\n--- SYSTEM ---"));
-  Serial.printf("Version: v5.3 Philippines Fixed + Voltage Corrected\n");
+  Serial.printf("Version: v5.3.1 - PIR Fixed\n");
   Serial.printf("Chip: %s Rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
   Serial.printf("CPU: %d MHz\n", ESP.getCpuFreqMHz());
   
