@@ -903,12 +903,12 @@ void runCalibration() {
   Serial.println(F("\n=== CALIBRATION MODE ==="));
   
   switch (calibrationStep) {
-    case 0:
+    case 0: {
       // Step 1: Measure zero current offset
       Serial.println(F("Step 1: Remove all loads, measuring zero current..."));
       digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
       delay(2000);
-      
+
       float zeroCurrentSum = 0;
       for (int i = 0; i < 100; i++) {
         int adcValue = analogRead(ACS712_PIN);
@@ -920,11 +920,12 @@ void runCalibration() {
       Serial.printf("→ Current offset: %.3f V\n", calData.currentOffset);
       calibrationStep++;
       break;
-      
-    case 1:
+    }
+
+    case 1: {
       // Step 2: Measure AC voltage offset
       Serial.println(F("Step 2: Measuring AC voltage offset..."));
-      
+
       float voltageSum = 0;
       for (int i = 0; i < 200; i++) {
         int adcValue = analogRead(ZMPT101B_PIN);
@@ -934,17 +935,18 @@ void runCalibration() {
       }
       calData.voltageOffset = voltageSum / 200.0;
       Serial.printf("→ Voltage offset: %.3f V\n", calData.voltageOffset);
-      
+
       // Save calibration
       saveCalibration();
       calibrationMode = false;
       calibrationStep = 0;
-      
+
       Serial.println(F("✓ Calibration complete!"));
-      
+
       // Send calibration complete message
       sendCommandAck("CALIBRATE", true, "Calibration completed successfully");
       break;
+    }
   }
 }
 
