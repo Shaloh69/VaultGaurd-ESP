@@ -104,10 +104,11 @@ using namespace websockets;
 // ==================== PIR SAFETY SETTINGS ====================
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds after motion stops
-#define PIR_CHECK_INTERVAL  50          // Check every 50ms
-#define PIR_DEBOUNCE_TIME   100         // Debounce 100ms
+#define PIR_CHECK_INTERVAL  20          // Check every 20ms (OPTIMIZED: was 50ms)
+#define PIR_DEBOUNCE_TIME   60          // Debounce 60ms (OPTIMIZED: was 100ms)
 #define PIR_ALERT_BEEPS     3           // Number of alert beeps
-#define PIR_SENSITIVITY     5           // Number of readings for debounce
+#define PIR_SENSITIVITY     3           // Number of readings for debounce (OPTIMIZED: was 5)
+#define PIR_DEBUG_LOGGING   true        // Enable detailed PIR debug logs
 
 // ==================== SYSTEM SETTINGS ====================
 #define SSR_ON_STATE        LOW
@@ -320,14 +321,20 @@ void setupSystem() {
   Serial.printf("Load Status: %s\n", loadPluggedIn ? "CONNECTED" : "EMPTY SOCKET");
   
   // PIR Safety System notification
-  Serial.println(F("\n╔════════════════════════════════════════╗"));
-  Serial.println(F("║   🛡️ CHILD SAFETY SYSTEM ENABLED 🛡️    ║"));
-  Serial.println(F("║                                        ║"));
-  Serial.println(F("║  PIR Sensor: HW-456 SR505-M           ║"));
-  Serial.println(F("║  Protection: Empty socket + Motion    ║"));
-  Serial.println(F("║  Action: Immediate power cutoff       ║"));
-  Serial.println(F("║  Warmup: 30 seconds required          ║"));
-  Serial.println(F("╚════════════════════════════════════════╝"));
+  Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+  Serial.println(F("║   🛡️  CHILD SAFETY SYSTEM ENABLED  🛡️              ║"));
+  Serial.println(F("║                                                    ║"));
+  Serial.println(F("║  PIR Sensor: HW-456 SR505-M (GPIO 18)             ║"));
+  Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
+  Serial.println(F("║  Action: Immediate power cutoff (<100ms)          ║"));
+  Serial.println(F("║  Warmup: 30 seconds required for PIR stability    ║"));
+  Serial.println(F("║                                                    ║"));
+  Serial.println(F("║  ⚡ OPTIMIZED PERFORMANCE SETTINGS:                ║"));
+  Serial.printf("║    • Check Interval: %dms (was 50ms)                 ║\n", PIR_CHECK_INTERVAL);
+  Serial.printf("║    • Buffer Size: %d readings (was 5)                ║\n", PIR_SENSITIVITY);
+  Serial.printf("║    • Detection Time: ~%dms (was ~150ms)             ║\n", PIR_CHECK_INTERVAL * PIR_SENSITIVITY);
+  Serial.printf("║    • Debug Logging: %s                              ║\n", PIR_DEBUG_LOGGING ? "ENABLED " : "DISABLED");
+  Serial.println(F("╚════════════════════════════════════════════════════╝"));
   
   // Connect to WiFi
   setupWiFi();
@@ -962,41 +969,81 @@ void updatePIRSafety() {
     ssrPirOverride = false;
     return;
   }
-  
+
   unsigned long now = millis();
-  
+
   // Check PIR sensor with debouncing
   if (now - lastPirCheck >= PIR_CHECK_INTERVAL) {
     lastPirCheck = now;
-    
+
     // Read PIR sensor
     int pirReading = digitalRead(PIR_SENSOR_PIN);
-    
+
+    #if PIR_DEBUG_LOGGING
+    // Log raw sensor reading
+    Serial.printf("[PIR] Raw Pin %d = %s | ", PIR_SENSOR_PIN, pirReading == HIGH ? "HIGH" : "LOW");
+    #endif
+
     // Update circular buffer for debouncing
     pirReadings[pirReadIndex] = pirReading;
     pirReadIndex = (pirReadIndex + 1) % PIR_SENSITIVITY;
-    
+
     // Count HIGH readings in buffer
     int highCount = 0;
     for (int i = 0; i < PIR_SENSITIVITY; i++) {
       if (pirReadings[i] == HIGH) highCount++;
     }
-    
-    // Motion detected if majority of readings are HIGH
+
+    #if PIR_DEBUG_LOGGING
+    // Log buffer state and decision
+    Serial.printf("Buffer [");
+    for (int i = 0; i < PIR_SENSITIVITY; i++) {
+      Serial.printf("%d", pirReadings[i]);
+      if (i < PIR_SENSITIVITY - 1) Serial.print(",");
+    }
+    Serial.printf("] | HIGH: %d/%d | ", highCount, PIR_SENSITIVITY);
+    #endif
+
+    // Motion detected if majority of readings are HIGH (OPTIMIZED: 2 out of 3)
     bool motionNow = (highCount >= (PIR_SENSITIVITY / 2 + 1));
-    
+
+    #if PIR_DEBUG_LOGGING
+    Serial.printf("Decision: %s", motionNow ? "MOTION" : "CLEAR");
+    #endif
+
     // Motion state changed
     if (motionNow && !pirMotionDetected) {
       pirMotionDetected = true;
       lastMotionTime = now;
       pirTriggerCount++;
-      Serial.println(F("\n⚠️ PIR: Motion detected!"));
+
+      Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+      Serial.println(F("║  ⚠️  MOTION DETECTED - PIR SENSOR TRIGGERED  ⚠️   ║"));
+      Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+      Serial.printf("→ Trigger #%d | Time: %lu ms | Load: %s\n",
+                    pirTriggerCount, now, loadPluggedIn ? "CONNECTED" : "EMPTY SOCKET");
+      Serial.printf("→ Current Reading: %.3f A (Threshold: %.2f A)\n",
+                    currentReading, LOAD_DETECTION_THRESHOLD);
+
     } else if (!motionNow && pirMotionDetected) {
       pirMotionDetected = false;
-      Serial.println(F("✓ PIR: Motion stopped"));
+      unsigned long motionDuration = now - lastMotionTime;
+
+      Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+      Serial.println(F("║  ✓ MOTION STOPPED - PIR SENSOR CLEAR         ✓   ║"));
+      Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+      Serial.printf("→ Motion Duration: %lu ms | Trigger Count: %d\n",
+                    motionDuration, pirTriggerCount);
     }
+
+    #if PIR_DEBUG_LOGGING
+    // Add newline for debug logs
+    if (!motionNow && pirMotionDetected == false) {
+      Serial.println(); // Clean log separation
+    }
+    #endif
   }
-  
+
   // PIR Safety Logic State Machine
   switch (pirState) {
     case PIR_IDLE:
@@ -1004,12 +1051,24 @@ void updatePIRSafety() {
         // DANGER: Motion detected with empty socket
         pirState = PIR_MOTION_NO_LOAD;
         ssrPirOverride = true;
-        
+
         // Alert sequence
-        Serial.println(F("\n🚨 CHILD SAFETY ALERT! 🚨"));
-        Serial.println(F("   Motion + Empty Socket → SSR OFF"));
-        
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║                                                   ║"));
+        Serial.println(F("║        🚨🚨🚨 CHILD SAFETY ALERT 🚨🚨🚨          ║"));
+        Serial.println(F("║                                                   ║"));
+        Serial.println(F("║   DANGER: Motion Detected Near Empty Socket!     ║"));
+        Serial.println(F("║   ACTION: SSR IMMEDIATELY DISABLED                ║"));
+        Serial.println(F("║                                                   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_IDLE → PIR_MOTION_NO_LOAD\n");
+        Serial.printf("→ SSR Override: ENGAGED (ssrPirOverride = true)\n");
+        Serial.printf("→ Current: %.3f A (below %.2f A threshold)\n",
+                      currentReading, LOAD_DETECTION_THRESHOLD);
+        Serial.println(F("→ Initiating 3-beep alert sequence..."));
+
         for (int i = 0; i < PIR_ALERT_BEEPS; i++) {
+          Serial.printf("   Beep %d/%d\n", i+1, PIR_ALERT_BEEPS);
           digitalWrite(RED_LED_PIN, HIGH);
           digitalWrite(BUZZER_PIN, HIGH);
           delay(150);
@@ -1017,57 +1076,102 @@ void updatePIRSafety() {
           digitalWrite(BUZZER_PIN, LOW);
           delay(150);
         }
+        Serial.println(F("→ Alert sequence complete. SSR remains OFF.\n"));
+
       } else if (pirMotionDetected && loadPluggedIn) {
         // Safe: Motion with load present
         pirState = PIR_MOTION_WITH_LOAD;
+
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ✓ SAFE MOTION DETECTED (Load Connected)     ✓   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_IDLE → PIR_MOTION_WITH_LOAD\n");
+        Serial.printf("→ Load Current: %.3f A (above %.2f A threshold)\n",
+                      currentReading, LOAD_DETECTION_THRESHOLD);
+        Serial.println(F("→ Normal operation continues. No safety override.\n"));
       }
       break;
-      
+
     case PIR_MOTION_NO_LOAD:
       // Keep SSR OFF while motion persists
       if (!pirMotionDetected) {
         // Motion stopped, enter cooldown
         pirState = PIR_COOLDOWN;
         lastMotionTime = now;
-        Serial.println(F("→ PIR: Entering cooldown period..."));
+
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  → ENTERING COOLDOWN PERIOD                   →   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_MOTION_NO_LOAD → PIR_COOLDOWN\n");
+        Serial.printf("→ Cooldown Duration: %d ms (%d seconds)\n",
+                      PIR_MOTION_TIMEOUT, PIR_MOTION_TIMEOUT/1000);
+        Serial.println(F("→ SSR Override: REMAINS ENGAGED during cooldown\n"));
       }
       // Check if load was plugged in
       if (loadPluggedIn) {
         pirState = PIR_MOTION_WITH_LOAD;
         ssrPirOverride = false;
-        Serial.println(F("✓ PIR: Load plugged in, releasing override"));
+
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ✓ LOAD PLUGGED IN - OVERRIDE RELEASED        ✓   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_MOTION_NO_LOAD → PIR_MOTION_WITH_LOAD\n");
+        Serial.printf("→ SSR Override: DISENGAGED (ssrPirOverride = false)\n");
+        Serial.printf("→ Load Current: %.3f A (above %.2f A threshold)\n",
+                      currentReading, LOAD_DETECTION_THRESHOLD);
+        Serial.println(F("→ SSR control restored to normal operation.\n"));
       }
       break;
-      
+
     case PIR_MOTION_WITH_LOAD:
       // Normal operation, just monitoring
       if (!pirMotionDetected) {
         pirState = PIR_IDLE;
+
+        Serial.println(F("\n→ PIR State: PIR_MOTION_WITH_LOAD → PIR_IDLE"));
+        Serial.println(F("   Motion stopped, returning to idle state.\n"));
       }
       if (!loadPluggedIn) {
         // Load unplugged during motion!
         pirState = PIR_MOTION_NO_LOAD;
         ssrPirOverride = true;
-        Serial.println(F("⚠️ PIR: Load unplugged during motion → SSR OFF"));
+
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ⚠️  LOAD UNPLUGGED DURING MOTION!            ⚠️   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_MOTION_WITH_LOAD → PIR_MOTION_NO_LOAD\n");
+        Serial.printf("→ SSR Override: ENGAGED (ssrPirOverride = true)\n");
+        Serial.printf("→ Current dropped to: %.3f A (below %.2f A)\n",
+                      currentReading, LOAD_DETECTION_THRESHOLD);
+        Serial.println(F("→ SSR IMMEDIATELY DISABLED for safety!\n"));
       }
       break;
-      
+
     case PIR_COOLDOWN:
       // Wait for cooldown period
       if (now - lastMotionTime >= PIR_MOTION_TIMEOUT) {
         // Cooldown complete
         pirState = PIR_IDLE;
         ssrPirOverride = false;
-        Serial.println(F("✓ PIR: Cooldown complete, resuming normal operation"));
+
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ✓ COOLDOWN COMPLETE - SYSTEM READY          ✓   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ State Transition: PIR_COOLDOWN → PIR_IDLE\n");
+        Serial.printf("→ SSR Override: DISENGAGED (ssrPirOverride = false)\n");
+        Serial.println(F("→ Normal operation resumed. PIR monitoring active.\n"));
       }
       // If motion detected again during cooldown
       if (pirMotionDetected) {
+        Serial.println(F("\n→ PIR: Motion detected during cooldown!"));
         if (loadPluggedIn) {
           pirState = PIR_MOTION_WITH_LOAD;
           ssrPirOverride = false;
+          Serial.printf("   Load present (%.3f A) → Transitioning to PIR_MOTION_WITH_LOAD\n", currentReading);
         } else {
           pirState = PIR_MOTION_NO_LOAD;
           ssrPirOverride = true;
+          Serial.printf("   Empty socket (%.3f A) → Extending safety override!\n", currentReading);
         }
       }
       break;
@@ -1216,19 +1320,27 @@ void printStatus() {
   Serial.printf("Energy: %.3f Wh\n", energyConsumed);
   Serial.printf("Apparent: %.1f VA, Reactive: %.1f VAR\n", apparentPower, reactivePower);
   
-  Serial.println(F("\n--- PIR SAFETY ---"));
-  Serial.printf("PIR: %s\n", pirEnabled ? "Enabled" : "Disabled");
-  Serial.printf("Motion: %s, Load: %s\n", 
-                pirMotionDetected ? "YES" : "NO",
-                loadPluggedIn ? "YES" : "NO");
+  Serial.println(F("\n--- PIR SAFETY (OPTIMIZED) ---"));
+  Serial.printf("PIR: %s\n", pirEnabled ? "✓ Enabled" : "✗ Disabled");
+  Serial.printf("Motion: %s, Load: %s (%.3f A)\n",
+                pirMotionDetected ? "⚠️  DETECTED" : "✓ CLEAR",
+                loadPluggedIn ? "✓ CONNECTED" : "⚠️  EMPTY",
+                currentReading);
   Serial.printf("PIR State: ");
   switch (pirState) {
-    case PIR_IDLE: Serial.println("IDLE"); break;
-    case PIR_MOTION_NO_LOAD: Serial.println("MOTION+NO_LOAD (SSR OFF)"); break;
-    case PIR_MOTION_WITH_LOAD: Serial.println("MOTION+LOAD"); break;
-    case PIR_COOLDOWN: Serial.println("COOLDOWN"); break;
+    case PIR_IDLE: Serial.println("✓ IDLE (Normal)"); break;
+    case PIR_MOTION_NO_LOAD: Serial.println("🚨 MOTION+NO_LOAD (SSR FORCED OFF)"); break;
+    case PIR_MOTION_WITH_LOAD: Serial.println("⚠️  MOTION+LOAD (Safe)"); break;
+    case PIR_COOLDOWN:
+      Serial.printf("⏳ COOLDOWN (%lu/%d ms)\n",
+                    millis() - lastMotionTime, PIR_MOTION_TIMEOUT);
+      break;
   }
-  Serial.printf("Triggers: %d\n", pirTriggerCount);
+  Serial.printf("Trigger Count: %d | Check Rate: %dms | Buffer: %d readings\n",
+                pirTriggerCount, PIR_CHECK_INTERVAL, PIR_SENSITIVITY);
+  Serial.printf("Detection Speed: ~%dms | Debug Logs: %s\n",
+                PIR_CHECK_INTERVAL * PIR_SENSITIVITY,
+                PIR_DEBUG_LOGGING ? "ON" : "OFF");
   
   Serial.println(F("\n--- SSR CONTROL ---"));
   Serial.printf("Command state: %s\n", ssrCommandState ? "ON" : "OFF");
