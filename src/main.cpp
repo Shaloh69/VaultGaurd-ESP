@@ -103,10 +103,11 @@ using namespace websockets;
 #define VOLTAGE_SAMPLES     100         // Number of voltage samples
 
 // ==================== PIR SAFETY SETTINGS ====================
-// IMPORTANT: HW-456 SR505-M has HARDWARE timer that keeps output HIGH after motion
-// - Adjustable via Tx potentiometer: 0.3s (min) to 200s (max)
-// - Set Tx to MINIMUM (turn counterclockwise fully) for fast response
-// - Pin stays HIGH for entire Tx duration even if motion stops
+// IMPORTANT: HW-456 SR505 Mini has FIXED hardware timer (no potentiometers)
+// - Output stays HIGH for ~2-3 seconds after motion detection (FIXED, cannot adjust)
+// - No Tx/Sx potentiometers on this model (compact design)
+// - This is NORMAL behavior - software handles the 2-3s delay correctly
+// - Detection range: ~3 meters (fixed)
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds after motion stops
 #define PIR_CHECK_INTERVAL  20          // Check every 20ms (OPTIMIZED: was 50ms)
@@ -335,17 +336,18 @@ void setupSystem() {
   Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
   Serial.println(F("║   🛡️  CHILD SAFETY SYSTEM ENABLED  🛡️              ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  PIR Sensor: HW-456 SR505-M (GPIO 18)             ║"));
+  Serial.println(F("║  PIR Sensor: HW-456 SR505 Mini (GPIO 18)          ║"));
   Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
   Serial.println(F("║  Action: Immediate power cutoff (<20ms)           ║"));
-  Serial.println(F("║  Warmup: 30 seconds required for PIR stability    ║"));
+  Serial.println(F("║  Warmup: 30-60 seconds for PIR stabilization      ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  ⚠️  HARDWARE ADJUSTMENT REQUIRED:                 ║"));
-  Serial.println(F("║    • Tx potentiometer: Set to MINIMUM (turn CCW)  ║"));
-  Serial.println(F("║    • Sx potentiometer: Adjust sensitivity as needed║"));
-  Serial.println(F("║    • If pin stays HIGH: Tx is set too high!       ║"));
+  Serial.println(F("║  📌 SR505 Mini Characteristics:                    ║"));
+  Serial.println(F("║    • Fixed time delay: ~2-3 seconds (normal!)     ║"));
+  Serial.println(F("║    • No potentiometers (compact fixed design)     ║"));
+  Serial.println(F("║    • Detection range: ~3 meters                   ║"));
+  Serial.println(F("║    • Pin stays HIGH 2-3s after motion (expected)  ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SETTINGS:                  ║"));
+  Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SOFTWARE SETTINGS:         ║"));
   Serial.printf("║    • Check Interval: %dms                            ║\n", PIR_CHECK_INTERVAL);
   Serial.printf("║    • Buffer Size: %d readings                        ║\n", PIR_SENSITIVITY);
   Serial.printf("║    • Confirm Threshold: %d/%d readings               ║\n", PIR_MOTION_CONFIRM_COUNT, PIR_SENSITIVITY);
