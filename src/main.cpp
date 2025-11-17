@@ -296,7 +296,7 @@ void setupSystem() {
   pinMode(GREEN_LED_PIN, OUTPUT);
   pinMode(BLUE_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PIR_SENSOR_PIN, INPUT);  // SR505-M has its own output driver, no pull resistor needed
+  pinMode(PIR_SENSOR_PIN, INPUT);  // No pull resistor with external voltage divider
   pinMode(ACS712_PIN, INPUT);
   pinMode(ZMPT101B_PIN, INPUT);
   
