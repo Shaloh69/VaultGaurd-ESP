@@ -50,7 +50,7 @@ using namespace websockets;
 #define RED_LED_PIN         2       // Error/Warning LED
 #define GREEN_LED_PIN       4       // Status OK LED
 #define BLUE_LED_PIN        19      // Data transmission LED
-#define PIR_SENSOR_PIN      18      // PIR motion sensor (HW-456 SR505-M)
+#define PIR_SENSOR_PIN      18      // PIR motion sensor (SR602 Mini)
 #define BUZZER_PIN          21      // Alert buzzer for safety warnings
 #define SD_CS_PIN           15      // SD Card chip select
 
@@ -68,7 +68,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.1-PIR-OPTIMIZED"
+#define DEVICE_VERSION      "7.2-SR602-FIXED"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -89,9 +89,12 @@ using namespace websockets;
 #define VOLTAGE_DIVIDER_RATIO 0.667     // Voltage divider for 3.3V ADC
 #define MAX_VALID_CURRENT   6.0         // Maximum valid current reading
 #define MIN_VALID_CURRENT   0.03        // Minimum current (noise threshold)
-#define LOAD_DETECTION_THRESHOLD_HIGH 0.10   // Current threshold for load CONNECT (with hysteresis)
-#define LOAD_DETECTION_THRESHOLD_LOW  0.05   // Current threshold for load DISCONNECT (prevents oscillation)
-#define CURRENT_SAMPLES     50          // Number of samples for averaging
+
+// ✅ ENHANCED LOAD DETECTION WITH WIDE HYSTERESIS (prevents oscillation)
+#define LOAD_DETECTION_THRESHOLD_HIGH 0.15   // Current threshold for load CONNECT: 150mA
+#define LOAD_DETECTION_THRESHOLD_LOW  0.03   // Current threshold for load DISCONNECT: 30mA
+#define LOAD_CONFIRM_READINGS 5              // Consecutive readings needed to confirm load state change
+#define CURRENT_SAMPLES     50               // Number of samples for averaging
 
 // ZMPT101B Voltage Sensor Calibration (Philippines 220V @ 60Hz)
 #define ZMPT101B_SENSITIVITY 0.004     // Sensor sensitivity
@@ -102,36 +105,48 @@ using namespace websockets;
 #define MIN_VOLTAGE         200.0       // Minimum valid voltage
 #define VOLTAGE_SAMPLES     100         // Number of voltage samples
 
-// ==================== PIR SAFETY SETTINGS ====================
-// IMPORTANT: HW-456 SR505 Mini has FIXED hardware timer (no potentiometers)
+// ==================== PIR SAFETY SETTINGS - SR602 MINI ====================
+// IMPORTANT: SR602 Mini has ADJUSTABLE hardware timers (Tx & Sx potentiometers)
 //
-// SAFETY TIMING (UPDATED - FIXED FALSE TRIGGER ISSUES):
-// - EMERGENCY SSR CUTOFF: ~15ms after debounce confirmation ⚡ OPTIMIZED ⚡
-// - Motion confirmation: ~15ms ⚡ OPTIMIZED (2/3 readings at 5ms intervals)
-// - SSR RELEASE: IMMEDIATE when motion stops (no delay!)
-// - SR505 pin stays HIGH: 2-3 seconds (sensor's built-in timer)
-// - Cooldown period: 10 seconds (prevents rapid re-triggers)
-//
-// HARDWARE CHARACTERISTICS:
-// - No Tx/Sx potentiometers on this model (compact design)
-// - 2-3 second delay is NORMAL and EXPECTED (sensor hardware timer)
-// - Detection range: ~3 meters (fixed)
+// ✅ SR602 MINI HARDWARE CHARACTERISTICS:
+// - HAS Tx potentiometer: Delay time 5-200 seconds (adjustable)
+// - HAS Sx potentiometer: Sensitivity 3-7 meters (adjustable)
+// - Retriggerable: YES (motion extends the HIGH period)
 // - Output: 3.3V (ESP32 compatible - NO voltage divider needed!)
+// - Recommended Tx setting: MINIMUM (5-10 seconds) for responsive operation
 //
-// FIXES APPLIED:
-// - Removed "first HIGH" emergency cutoff (was causing false triggers)
-// - SSR now releases IMMEDIATELY when motion stops (was 10s delay)
-// - Added comprehensive logging to diagnose random toggling
+// ⚡ OPTIMIZED SAFETY TIMING:
+// - EMERGENCY SSR CUTOFF: ~15ms after debounce confirmation
+// - Motion confirmation: ~15ms (2/3 readings at 5ms intervals)
+// - SSR RELEASE: IMMEDIATE when motion stops (no delay!)
+// - SR602 pin stays HIGH: 5-200+ seconds (depends on Tx potentiometer setting)
+// - Cooldown period: 10 seconds (prevents rapid re-triggers)
+// - Stuck sensor timeout: 300 seconds (auto-recovery if sensor stuck HIGH)
+//
+// 🛡️ ENHANCED PROTECTIONS:
+// - Auto-timeout if sensor stuck HIGH >300s (prevents SSR locked OFF)
+// - Enhanced load detection with consecutive reading confirmation
+// - Wider hysteresis gap to prevent oscillation (0.15A/0.03A)
+// - SR602-aware debouncing for long HIGH periods
+//
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds cooldown after motion stops
-#define PIR_CHECK_INTERVAL  5          // ⚡ OPTIMIZED: 5ms (was 20ms) - 4x faster!
-#define PIR_DEBOUNCE_TIME   30          // Debounce 60ms (⚡ OPTIMIZED: 30ms (was 60ms))
-#define PIR_ALERT_BEEPS     3           // Number of alert beeps
-#define PIR_SENSITIVITY     3           // Number of readings for debounce (increased for stability)
-#define PIR_MOTION_CONFIRM_COUNT 2      // ⚡ OPTIMIZED: 2/3 readings (was 4/5) - faster trigger!
-#define PIR_CLEAR_CONFIRM_COUNT  2      // Require 4 out of 5 LOW readings to confirm clear
-#define PIR_STATE_MIN_TIME  250         // ⚡ OPTIMIZED: 250ms (was 500ms) - faster transitions!
-#define PIR_DEBUG_LOGGING   true        // Enable detailed PIR debug logs
+#define PIR_CHECK_INTERVAL  5          // 5ms polling interval
+#define PIR_DEBOUNCE_TIME   30         // 30ms debounce time
+#define PIR_ALERT_BEEPS     3          // Number of alert beeps
+#define PIR_SENSITIVITY     3          // Number of readings in debounce buffer
+#define PIR_MOTION_CONFIRM_COUNT 2     // Need 2/3 readings HIGH to confirm motion
+#define PIR_CLEAR_CONFIRM_COUNT  2     // Need 2/3 readings LOW to confirm clear
+#define PIR_STATE_MIN_TIME  250        // Minimum time in state before transition (anti-oscillation)
+#define PIR_DEBUG_LOGGING   true       // Enable detailed PIR debug logs
+
+// ✅ SR602-SPECIFIC SETTINGS
+#define PIR_MODEL           "SR602"    // Sensor model identifier
+#define PIR_EXPECTED_MIN_HIGH_TIME  5000    // Minimum expected HIGH time (Tx at min): 5 seconds
+#define PIR_EXPECTED_MAX_HIGH_TIME  200000  // Maximum expected HIGH time (Tx at max): 200 seconds
+#define PIR_STUCK_TIMEOUT   300000     // Auto-recovery timeout: 300 seconds (5 minutes)
+#define PIR_STUCK_WARNING_TIME 15000   // Warn if stuck HIGH >15 seconds
+#define PIR_RECOMMEND_TX_ADJUSTMENT true    // Recommend Tx adjustment to user
 
 // ==================== SYSTEM SETTINGS ====================
 #define SSR_ON_STATE        LOW
@@ -231,8 +246,17 @@ int pirReadings[PIR_SENSITIVITY] = {0};
 int pirReadIndex = 0;
 int consecutiveMotionDetections = 0;       // Track consecutive motion readings
 int consecutiveClearDetections = 0;        // Track consecutive clear readings
-unsigned long pirStuckHighStartTime = 0;   // ✅ Track when sensor might be stuck
-bool pirStuckHighWarned = false;           // ✅ Flag to avoid spam warnings
+
+// ✅ SR602 STUCK-SENSOR PROTECTION
+unsigned long pirStuckHighStartTime = 0;   // Track when sensor went HIGH
+bool pirStuckHighWarned = false;           // Warning flag (avoid spam)
+bool pirStuckTimeoutActive = false;        // Auto-recovery timeout active
+unsigned long pirStuckTimeoutStart = 0;    // When timeout was activated
+
+// ✅ ENHANCED LOAD DETECTION
+int consecutiveLoadHighReadings = 0;       // Consecutive readings above HIGH threshold
+int consecutiveLoadLowReadings = 0;        // Consecutive readings below LOW threshold
+float lastCurrentReading = 0.0;            // Previous current reading for comparison
 
 // Statistics
 unsigned long loopCount = 0;
@@ -352,28 +376,31 @@ void setupSystem() {
   Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
   Serial.println(F("║   🛡️  CHILD SAFETY SYSTEM ENABLED  🛡️              ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  PIR Sensor: HW-456 SR505 Mini (GPIO 18)          ║"));
+  Serial.println(F("║  PIR Sensor: SR602 Mini (GPIO 18)                 ║"));
   Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
-  Serial.println(F("║  Action: ⚡ CUTOFF ~100ms after confirmation       ║"));
+  Serial.println(F("║  Action: ⚡ CUTOFF ~15ms after confirmation        ║"));
   Serial.println(F("║  Release: ⚡ IMMEDIATE when motion stops           ║"));
   Serial.println(F("║  Warmup: 30-60 seconds for PIR stabilization      ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  📌 SR505 Mini Characteristics:                    ║"));
-  Serial.println(F("║    • SSR cutoff: ~100ms (after debouncing)        ║"));
+  Serial.println(F("║  📌 SR602 Mini Characteristics:                    ║"));
+  Serial.println(F("║    • SSR cutoff: ~15ms (after debouncing)         ║"));
   Serial.println(F("║    • SSR release: IMMEDIATE (no delay!)           ║"));
-  Serial.println(F("║    • Motion confirmation: ~100ms (debounced)      ║"));
-  Serial.println(F("║    • SR505 pin delay: 2-3s (hardware timer)       ║"));
-  Serial.println(F("║    • No potentiometers (compact fixed design)     ║"));
-  Serial.println(F("║    • Detection range: ~3 meters                   ║"));
+  Serial.println(F("║    • Motion confirmation: ~15ms (debounced)       ║"));
+  Serial.println(F("║    • SR602 pin delay: 5-200s (Tx potentiometer)  ║"));
+  Serial.println(F("║    • HAS Tx/Sx potentiometers (adjustable)        ║"));
+  Serial.println(F("║    • Detection range: 3-7m (Sx adjustable)        ║"));
   Serial.println(F("║    • Output: 3.3V (NO voltage divider needed!)    ║"));
+  Serial.println(F("║    • ⚠️ RECOMMEND: Set Tx to MINIMUM (5-10s)      ║"));
   Serial.println(F("║                                                    ║"));
-  Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SOFTWARE SETTINGS:         ║"));
+  Serial.println(F("║  ⚡ ENHANCED PROTECTION FEATURES:                  ║"));
   Serial.printf("║    • Check Interval: %dms                            ║\n", PIR_CHECK_INTERVAL);
   Serial.printf("║    • Buffer Size: %d readings                        ║\n", PIR_SENSITIVITY);
   Serial.printf("║    • Confirm Threshold: %d/%d readings               ║\n", PIR_MOTION_CONFIRM_COUNT, PIR_SENSITIVITY);
   Serial.printf("║    • Detection Time: ~%dms                          ║\n", PIR_CHECK_INTERVAL * PIR_SENSITIVITY);
-  Serial.printf("║    • Load Hysteresis: %.2fA/%.2fA (ON/OFF)          ║\n", LOAD_DETECTION_THRESHOLD_HIGH, LOAD_DETECTION_THRESHOLD_LOW);
+  Serial.printf("║    • Load Hysteresis: %.2fA/%.2fA (CONNECT/DISC)    ║\n", LOAD_DETECTION_THRESHOLD_HIGH, LOAD_DETECTION_THRESHOLD_LOW);
+  Serial.printf("║    • Load Confirmation: %d consecutive readings      ║\n", LOAD_CONFIRM_READINGS);
   Serial.printf("║    • Min State Time: %dms (anti-oscillation)        ║\n", PIR_STATE_MIN_TIME);
+  Serial.printf("║    • Stuck Timeout: %ds (auto-recovery)             ║\n", PIR_STUCK_TIMEOUT/1000);
   Serial.printf("║    • Debug Logging: %s                              ║\n", PIR_DEBUG_LOGGING ? "ENABLED " : "DISABLED");
   Serial.println(F("╚════════════════════════════════════════════════════╝"));
   
@@ -888,25 +915,60 @@ void updateSensors() {
     lastEnergyUpdate = now;
   }
 
-  // Check if load is plugged in WITH HYSTERESIS (prevents oscillation)
-  // Use different thresholds for connecting vs disconnecting
+  // ✅ ENHANCED LOAD DETECTION WITH CONSECUTIVE READING CONFIRMATION
+  // This prevents oscillation from noise/interference near threshold values
+  // Requires LOAD_CONFIRM_READINGS consecutive readings to change state
+
   if (loadPluggedIn) {
-    // Currently has load - use LOWER threshold to confirm disconnect
+    // Currently has load - check if it disconnected
     if (currentReading < LOAD_DETECTION_THRESHOLD_LOW) {
-      loadPluggedIn = false;
-      #if PIR_DEBUG_LOGGING
-      Serial.printf("\n[LOAD] Disconnected: %.3fA < %.2fA\n", currentReading, LOAD_DETECTION_THRESHOLD_LOW);
-      #endif
+      consecutiveLoadLowReadings++;
+      consecutiveLoadHighReadings = 0;  // Reset opposite counter
+
+      // Confirm disconnect after consecutive readings
+      if (consecutiveLoadLowReadings >= LOAD_CONFIRM_READINGS) {
+        loadPluggedIn = false;
+        consecutiveLoadLowReadings = 0;  // Reset counter
+        #if PIR_DEBUG_LOGGING
+        Serial.println(F("\n╔══════════════════════════════════════════╗"));
+        Serial.println(F("║  🔌 LOAD DISCONNECTED (CONFIRMED)        ║"));
+        Serial.println(F("╚══════════════════════════════════════════╝"));
+        Serial.printf("→ Current: %.3fA < %.2fA (threshold)\n", currentReading, LOAD_DETECTION_THRESHOLD_LOW);
+        Serial.printf("→ Confirmed by %d consecutive readings\n", LOAD_CONFIRM_READINGS);
+        Serial.println(F("→ SSR may be disabled if motion detected\n"));
+        #endif
+      }
+    } else {
+      // Still above threshold - reset counter
+      consecutiveLoadLowReadings = 0;
     }
   } else {
-    // Currently no load - use HIGHER threshold to confirm connect
+    // Currently no load - check if load connected
     if (currentReading > LOAD_DETECTION_THRESHOLD_HIGH) {
-      loadPluggedIn = true;
-      #if PIR_DEBUG_LOGGING
-      Serial.printf("\n[LOAD] Connected: %.3fA > %.2fA\n", currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
-      #endif
+      consecutiveLoadHighReadings++;
+      consecutiveLoadLowReadings = 0;  // Reset opposite counter
+
+      // Confirm connection after consecutive readings
+      if (consecutiveLoadHighReadings >= LOAD_CONFIRM_READINGS) {
+        loadPluggedIn = true;
+        consecutiveLoadHighReadings = 0;  // Reset counter
+        #if PIR_DEBUG_LOGGING
+        Serial.println(F("\n╔══════════════════════════════════════════╗"));
+        Serial.println(F("║  🔌 LOAD CONNECTED (CONFIRMED)           ║"));
+        Serial.println(F("╚══════════════════════════════════════════╝"));
+        Serial.printf("→ Current: %.3fA > %.2fA (threshold)\n", currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
+        Serial.printf("→ Confirmed by %d consecutive readings\n", LOAD_CONFIRM_READINGS);
+        Serial.println(F("→ PIR override will be released if active\n"));
+        #endif
+      }
+    } else {
+      // Still below threshold - reset counter
+      consecutiveLoadHighReadings = 0;
     }
   }
+
+  // Track current reading for comparison
+  lastCurrentReading = currentReading;
 }
 
 // ==================== CURRENT READING WITH CIRCUITIQ CALIBRATION ====================
@@ -1039,33 +1101,66 @@ void updatePIRSafety() {
     // Read PIR sensor
     int pirReading = digitalRead(PIR_SENSOR_PIN);
 
-    // ✅ HEALTH MONITORING: Detect if sensor stuck HIGH for extended period
+    // ✅ SR602 HEALTH MONITORING: Detect if sensor stuck HIGH for extended period
     if (pirReading == HIGH) {
       if (pirStuckHighStartTime == 0) {
-        pirStuckHighStartTime = now;  // Start tracking
-      } else {
-        unsigned long stuckDuration = now - pirStuckHighStartTime;
-        // If HIGH for more than 5 seconds continuously, warn user
-        if (stuckDuration > 5000 && !pirStuckHighWarned) {
-          Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
-          Serial.println(F("║  ⚠️  PIR SENSOR HEALTH WARNING                     ║"));
-          Serial.println(F("╚════════════════════════════════════════════════════╝"));
-          Serial.printf("→ Sensor has been HIGH continuously for %.1f seconds\n", stuckDuration/1000.0);
-          Serial.println(F("→ This is ABNORMAL for HW-456 SR505 Mini"));
-          Serial.println(F("→ Possible issues:"));
-          Serial.println(F("   1. Wiring problem (check connections)"));
-          Serial.println(F("   2. Sensor requires warmup (wait 60 seconds after power-on)"));
-          Serial.println(F("   3. External voltage divider interfering (remove if present!)"));
-          Serial.println(F("   4. Faulty sensor"));
-          Serial.println(F("\n→ System continues operating with PIR safety active.\n"));
-          pirStuckHighWarned = true;
+        pirStuckHighStartTime = now;  // Start tracking when sensor went HIGH
+      }
+
+      unsigned long stuckDuration = now - pirStuckHighStartTime;
+
+      // ⚠️ WARNING: If HIGH for more than 15 seconds, warn user about Tx setting
+      if (stuckDuration > PIR_STUCK_WARNING_TIME && !pirStuckHighWarned) {
+        Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ⚠️  SR602 SENSOR EXTENDED HIGH PERIOD             ║"));
+        Serial.println(F("╚════════════════════════════════════════════════════╝"));
+        Serial.printf("→ Sensor HIGH continuously for %.1f seconds\n", stuckDuration/1000.0);
+        Serial.println(F("→ This is NORMAL for SR602 if Tx potentiometer is set high"));
+        Serial.println(F("→ SR602 can stay HIGH for 5-200 seconds (depends on Tx)"));
+        Serial.println(F("→ RECOMMENDATION: Adjust Tx potentiometer to MINIMUM"));
+        Serial.println(F("   • Turn Tx potentiometer fully COUNTER-CLOCKWISE"));
+        Serial.println(F("   • This sets delay to ~5-10 seconds (more responsive)"));
+        Serial.println(F("   • Current setting appears to be >15 seconds"));
+        Serial.printf("→ Auto-recovery activates at %d seconds\n", PIR_STUCK_TIMEOUT/1000);
+        Serial.println(F("→ System continues monitoring...\n"));
+        pirStuckHighWarned = true;
+      }
+
+      // 🛡️ AUTO-RECOVERY: If stuck HIGH beyond timeout, temporarily disable PIR override
+      if (stuckDuration > PIR_STUCK_TIMEOUT && !pirStuckTimeoutActive) {
+        pirStuckTimeoutActive = true;
+        pirStuckTimeoutStart = now;
+
+        Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+        Serial.println(F("║  🛡️  AUTO-RECOVERY ACTIVATED                       ║"));
+        Serial.println(F("╚════════════════════════════════════════════════════╝"));
+        Serial.printf("→ Sensor stuck HIGH for %.1f seconds (>%d second timeout)\n",
+                      stuckDuration/1000.0, PIR_STUCK_TIMEOUT/1000);
+        Serial.println(F("→ Temporarily releasing PIR override to prevent SSR locked OFF"));
+        Serial.println(F("→ URGENT: Adjust SR602 Tx potentiometer to minimum!"));
+        Serial.println(F("→ PIR safety monitoring continues normally\n"));
+
+        // Release PIR override if active
+        if (ssrPirOverride) {
+          ssrPirOverride = false;
+          Serial.println(F("✓ PIR override released - SSR control restored\n"));
         }
       }
+
     } else {
       // Reset stuck detection when we see a LOW reading
       if (pirStuckHighStartTime != 0) {
+        unsigned long totalHighTime = now - pirStuckHighStartTime;
+
+        // Log if it was a long HIGH period
+        if (totalHighTime > PIR_EXPECTED_MIN_HIGH_TIME) {
+          Serial.printf("\n[PIR] Sensor was HIGH for %.1f seconds (Tx setting detected)\n",
+                       totalHighTime/1000.0);
+        }
+
         pirStuckHighStartTime = 0;
-        pirStuckHighWarned = false;  // Reset warning flag
+        pirStuckHighWarned = false;
+        pirStuckTimeoutActive = false;
       }
     }
 
@@ -1431,7 +1526,7 @@ void runCalibration() {
 // ==================== PIR SENSOR DIAGNOSTICS ====================
 bool diagnosePIRSensor() {
   Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
-  Serial.println(F("║   🔍 PIR SENSOR DIAGNOSTIC TEST (HW-456 SR505)     ║"));
+  Serial.println(F("║   🔍 PIR SENSOR DIAGNOSTIC TEST (SR602 Mini)       ║"));
   Serial.println(F("╚════════════════════════════════════════════════════╝"));
 
   // Take 20 rapid readings over 1 second to check sensor behavior
@@ -1460,33 +1555,42 @@ bool diagnosePIRSensor() {
   bool sensorHealthy = true;
 
   if (highReadings == 20) {
-    Serial.println(F("\n❌ ERROR: PIR sensor STUCK HIGH (all 20 readings = 1)"));
-    Serial.println(F("   Possible causes:"));
-    Serial.println(F("   1. Sensor is continuously detecting motion (unlikely for 1 second)"));
-    Serial.println(F("   2. Wiring issue - sensor output shorted to 3.3V"));
-    Serial.println(F("   3. Faulty sensor"));
-    Serial.println(F("   4. Voltage divider issue (if present - should NOT be needed!)"));
-    Serial.println(F("   5. Sensor not warmed up yet (wait 30-60 seconds)"));
+    Serial.println(F("\n⚠️  NOTICE: PIR sensor reading HIGH continuously"));
+    Serial.println(F("   For SR602 Mini, this could be NORMAL:"));
+    Serial.println(F("   1. Motion detected - SR602 stays HIGH for 5-200 seconds"));
+    Serial.println(F("   2. Tx potentiometer set to high value (long delay)"));
+    Serial.println(F("   3. Sensor is retriggering (motion keeps extending time)"));
+    Serial.println(F("   4. Sensor warming up (wait 30-60 seconds after power-on)"));
+    Serial.println(F("\n   Other possible issues:"));
+    Serial.println(F("   5. Wiring issue - sensor output shorted to 3.3V"));
+    Serial.println(F("   6. Faulty sensor"));
     Serial.println(F("\n   RECOMMENDED ACTIONS:"));
     Serial.println(F("   → Wait 60 seconds for sensor warmup"));
-    Serial.println(F("   → Check wiring: HW-456 has 3 pins: VCC, OUT, GND"));
+    Serial.println(F("   → If still HIGH, adjust Tx potentiometer to MINIMUM"));
+    Serial.println(F("   → Turn Tx potentiometer fully COUNTER-CLOCKWISE"));
+    Serial.println(F("   → Check wiring: SR602 has 3 pins: VCC, OUT, GND"));
     Serial.println(F("   → Verify OUT connects directly to GPIO 18 (no voltage divider!)"));
-    Serial.println(F("   → HW-456 SR505 Mini outputs 3.3V - compatible with ESP32"));
-    sensorHealthy = false;
+    Serial.println(F("   → SR602 Mini outputs 3.3V - compatible with ESP32"));
+    Serial.println(F("   → Auto-recovery will activate if stuck >300 seconds"));
+    sensorHealthy = true;  // Might be normal for SR602
   }
   else if (lowReadings == 20) {
-    Serial.println(F("\n✓ GOOD: PIR sensor reading LOW (no motion detected)"));
+    Serial.println(F("\n✓ EXCELLENT: PIR sensor reading LOW (no motion detected)"));
     Serial.println(F("   Sensor appears to be working correctly."));
     Serial.println(F("   Try moving in front of sensor to test motion detection."));
+    Serial.println(F("   Expect sensor to stay HIGH for 5-200s after motion stops"));
+    Serial.println(F("   (duration depends on Tx potentiometer setting)"));
     sensorHealthy = true;
   }
   else {
-    Serial.println(F("\n⚠️  WARNING: PIR sensor showing mixed readings"));
+    Serial.println(F("\n⚠️  NOTICE: PIR sensor showing mixed readings"));
     Serial.printf("   This could indicate:\n");
-    Serial.println(F("   • Actual motion being detected (normal)"));
+    Serial.println(F("   • Actual motion being detected (NORMAL)"));
     Serial.println(F("   • Sensor warming up (wait 30-60 seconds)"));
-    Serial.println(F("   • Environmental interference"));
-    sensorHealthy = true;  // Might be normal
+    Serial.println(F("   • Tx delay period ending (sensor transitioning LOW)"));
+    Serial.println(F("   • Environmental interference (rare)"));
+    Serial.println(F("\n   For SR602, mixed readings are often normal during operation."));
+    sensorHealthy = true;  // Normal for SR602
   }
 
   Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
@@ -1534,11 +1638,16 @@ void sendSystemStatus() {
   
   // PIR status
   JsonObject pir = doc.createNestedObject("pir");
+  pir["model"] = PIR_MODEL;
   pir["enabled"] = pirEnabled;
   pir["motion"] = pirMotionDetected;
   pir["state"] = pirState;
   pir["triggers"] = pirTriggerCount;
   pir["override"] = ssrPirOverride;
+  pir["stuckTimeout"] = pirStuckTimeoutActive;
+  if (pirStuckHighStartTime > 0) {
+    pir["highDuration"] = (millis() - pirStuckHighStartTime) / 1000;
+  }
   
   // SSR status
   JsonObject ssr = doc.createNestedObject("ssr");
@@ -1583,14 +1692,15 @@ void printStatus() {
   Serial.printf("Energy: %.3f Wh\n", energyConsumed);
   Serial.printf("Apparent: %.1f VA, Reactive: %.1f VAR\n", apparentPower, reactivePower);
   
-  Serial.println(F("\n--- PIR SAFETY (STABILITY-OPTIMIZED) ---"));
-  Serial.printf("PIR: %s\n", pirEnabled ? "✓ Enabled" : "✗ Disabled");
+  Serial.println(F("\n--- PIR SAFETY (SR602 ENHANCED) ---"));
+  Serial.printf("PIR Model: %s | Status: %s\n", PIR_MODEL, pirEnabled ? "✓ Enabled" : "✗ Disabled");
   Serial.printf("Motion: %s, Load: %s (%.3f A)\n",
                 pirMotionDetected ? "⚠️  DETECTED" : "✓ CLEAR",
                 loadPluggedIn ? "✓ CONNECTED" : "⚠️  EMPTY",
                 currentReading);
   Serial.printf("Load Hysteresis: %.2fA (connect) / %.2fA (disconnect)\n",
                 LOAD_DETECTION_THRESHOLD_HIGH, LOAD_DETECTION_THRESHOLD_LOW);
+  Serial.printf("Load Confirmation: %d consecutive readings required\n", LOAD_CONFIRM_READINGS);
   Serial.printf("PIR State: ");
   unsigned long timeInState = millis() - pirStateEntryTime;
   switch (pirState) {
@@ -1602,15 +1712,29 @@ void printStatus() {
                     millis() - lastMotionTime, PIR_MOTION_TIMEOUT);
       break;
   }
+
+  // Show stuck sensor status if applicable
+  if (pirStuckHighStartTime > 0) {
+    unsigned long stuckDuration = millis() - pirStuckHighStartTime;
+    Serial.printf("⚠️  Sensor HIGH Duration: %.1fs", stuckDuration/1000.0);
+    if (pirStuckTimeoutActive) {
+      Serial.print(" (AUTO-RECOVERY ACTIVE)");
+    }
+    Serial.println();
+  }
+
   Serial.printf("Trigger Count: %d | Check Rate: %dms | Buffer: %d readings\n",
                 pirTriggerCount, PIR_CHECK_INTERVAL, PIR_SENSITIVITY);
   Serial.printf("Confirm Threshold: %d/%d (motion), %d/%d (clear)\n",
                 PIR_MOTION_CONFIRM_COUNT, PIR_SENSITIVITY,
                 PIR_CLEAR_CONFIRM_COUNT, PIR_SENSITIVITY);
-  Serial.printf("Detection Speed: ~%dms | State Guard: %dms | Debug: %s\n",
+  Serial.printf("Detection: ~%dms | State Guard: %dms | Stuck Timeout: %ds\n",
                 PIR_CHECK_INTERVAL * PIR_SENSITIVITY,
                 PIR_STATE_MIN_TIME,
-                PIR_DEBUG_LOGGING ? "ON" : "OFF");
+                PIR_STUCK_TIMEOUT/1000);
+  Serial.printf("Debug: %s | Auto-Recovery: %s\n",
+                PIR_DEBUG_LOGGING ? "ON" : "OFF",
+                pirStuckTimeoutActive ? "ACTIVE" : "Ready");
   
   Serial.println(F("\n--- SSR CONTROL ---"));
   Serial.printf("Command state: %s\n", ssrCommandState ? "ON" : "OFF");
