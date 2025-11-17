@@ -1,12 +1,13 @@
 /*
- * VaultGuard v7.0 - COMPLETE PRODUCTION VERSION FOR RENDER.COM
+ * VaultGuard v7.3 - SMART PIR MONITORING VERSION
  * Server: https://meifhi-esp-server.onrender.com
- * 
+ *
  * ✅ FIXED FOR RENDER.COM DEPLOYMENT
  * ✅ ALL FUNCTIONALITY PRESERVED
  * ✅ DEVICE TYPE CORRECTED
  * ✅ SSL/TLS CONFIGURED FOR RENDER
- * 
+ * ✅ SMART PIR: Only monitors when socket is EMPTY
+ *
  * FEATURES:
  * ✓ WebSocket bidirectional communication with SSL
  * ✓ HTTPS POST data transmission with retry logic
@@ -14,7 +15,7 @@
  * ✓ Auto-reconnection with exponential backoff
  * ✓ Comprehensive sensor calibration system
  * ✓ Full server protocol compliance
- * ✓ PIR child safety system
+ * ✓ Smart PIR child safety (only active for empty sockets)
  * ✓ Energy monitoring and reporting
  * 
  * SENSOR CALIBRATION:
@@ -68,7 +69,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.2-SR602-FIXED"
+#define DEVICE_VERSION      "7.3-PIR-SMART"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -116,6 +117,8 @@ using namespace websockets;
 // - Recommended Tx setting: MINIMUM (5-10 seconds) for responsive operation
 //
 // ⚡ OPTIMIZED SAFETY TIMING:
+// - PIR MONITORING: ONLY ACTIVE when socket is EMPTY (no load detected)
+// - PIR DISABLED: Automatically when load is plugged in (not needed)
 // - EMERGENCY SSR CUTOFF: ~15ms after debounce confirmation
 // - Motion confirmation: ~15ms (2/3 readings at 5ms intervals)
 // - SSR RELEASE: IMMEDIATE when motion stops (no delay!)
@@ -377,8 +380,9 @@ void setupSystem() {
   Serial.println(F("║   🛡️  CHILD SAFETY SYSTEM ENABLED  🛡️              ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  PIR Sensor: SR602 Mini (GPIO 18)                 ║"));
-  Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
-  Serial.println(F("║  Action: ⚡ CUTOFF ~15ms after confirmation        ║"));
+  Serial.println(F("║  Protection: ONLY for empty sockets                ║"));
+  Serial.println(F("║  Monitoring: DISABLED when load plugged in        ║"));
+  Serial.println(F("║  Action: ⚡ CUTOFF ~15ms after motion confirmed    ║"));
   Serial.println(F("║  Release: ⚡ IMMEDIATE when motion stops           ║"));
   Serial.println(F("║  Warmup: 30-60 seconds for PIR stabilization      ║"));
   Serial.println(F("║                                                    ║"));
@@ -1089,6 +1093,39 @@ void updatePIRSafety() {
     pirState = PIR_IDLE;
     ssrPirOverride = false;
     return;
+  }
+
+  // ✅ DISABLE PIR MONITORING IF LOAD IS PLUGGED IN
+  // PIR safety is only needed for empty sockets (child safety)
+  // If something is already plugged in, no need to monitor
+  if (loadPluggedIn) {
+    // Reset PIR state if it was active
+    if (pirState != PIR_IDLE || ssrPirOverride) {
+      Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+      Serial.println(F("║  ✓ LOAD DETECTED - PIR MONITORING DISABLED   ✓   ║"));
+      Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+      Serial.printf("→ Load Current: %.3f A (above %.2f A threshold)\n",
+                    currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
+      Serial.println(F("→ PIR monitoring paused - socket is not empty"));
+      Serial.println(F("→ SSR override released (if active)"));
+      Serial.println(F("→ PIR will resume when load is disconnected\n"));
+
+      pirState = PIR_IDLE;
+      ssrPirOverride = false;
+      pirMotionDetected = false;
+
+      // Reset PIR buffer
+      for (int i = 0; i < PIR_SENSITIVITY; i++) {
+        pirReadings[i] = 0;
+      }
+      pirReadIndex = 0;
+
+      // Reset stuck sensor tracking
+      pirStuckHighStartTime = 0;
+      pirStuckHighWarned = false;
+      pirStuckTimeoutActive = false;
+    }
+    return;  // Skip all PIR monitoring while load is present
   }
 
   unsigned long now = millis();
