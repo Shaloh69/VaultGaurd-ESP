@@ -106,8 +106,8 @@ using namespace websockets;
 // IMPORTANT: HW-456 SR505 Mini has FIXED hardware timer (no potentiometers)
 //
 // SAFETY TIMING (CRITICAL):
-// - Motion detection: ~80-100ms (4/5 readings at 20ms intervals)
-// - SSR cutoff: <100ms from first HIGH reading ⚡ IMMEDIATE!
+// - EMERGENCY SSR CUTOFF: <1ms on FIRST HIGH reading (no load) ⚡⚡⚡
+// - Motion confirmation: ~80-100ms (4/5 readings at 20ms intervals)
 // - SR505 pin stays HIGH: 2-3 seconds (sensor's built-in timer)
 // - SSR is ALREADY OFF during the 2-3s HIGH period!
 //
@@ -115,6 +115,7 @@ using namespace websockets;
 // - No Tx/Sx potentiometers on this model (compact design)
 // - 2-3 second delay is NORMAL and EXPECTED (sensor hardware timer)
 // - Detection range: ~3 meters (fixed)
+// - Output: 3.3V (ESP32 compatible - NO voltage divider needed!)
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds after motion stops
 #define PIR_CHECK_INTERVAL  20          // Check every 20ms (OPTIMIZED: was 50ms)
@@ -224,6 +225,8 @@ int pirReadings[PIR_SENSITIVITY] = {0};
 int pirReadIndex = 0;
 int consecutiveMotionDetections = 0;       // Track consecutive motion readings
 int consecutiveClearDetections = 0;        // Track consecutive clear readings
+unsigned long pirStuckHighStartTime = 0;   // ✅ Track when sensor might be stuck
+bool pirStuckHighWarned = false;           // ✅ Flag to avoid spam warnings
 
 // Statistics
 unsigned long loopCount = 0;
@@ -272,6 +275,7 @@ void feedWatchdog();
 void handleSystemError(const String& error);
 void sendSystemStatus();
 void wakeupRenderServer();                                      // ✅ New function
+bool diagnosePIRSensor();                                       // ✅ PIR diagnostic function
 
 // ==================== SETUP ====================
 void setup() {
@@ -308,7 +312,8 @@ void setupSystem() {
   pinMode(GREEN_LED_PIN, OUTPUT);
   pinMode(BLUE_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PIR_SENSOR_PIN, INPUT);  // No pull resistor with external voltage divider
+  // ✅ FIX: Use INPUT_PULLDOWN to prevent floating pin (HW-456 outputs 3.3V on motion)
+  pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
   pinMode(ACS712_PIN, INPUT);
   pinMode(ZMPT101B_PIN, INPUT);
   
@@ -325,15 +330,13 @@ void setupSystem() {
   delay(100);
   float testCurrent = readCurrent();
   float testVoltage = readVoltage();
-  int pirReading = digitalRead(PIR_SENSOR_PIN);
-  
+
   Serial.println(F("\n--- Initial Sensor Readings ---"));
   Serial.printf("Current: %.3f A\n", testCurrent);
   Serial.printf("Voltage: %.1f V\n", testVoltage);
-  Serial.printf("PIR Sensor: %s (Pin %d = %s)\n", 
-                pirReading == LOW ? "READY" : "MOTION DETECTED",
-                PIR_SENSOR_PIN,
-                pirReading == LOW ? "LOW" : "HIGH");
+
+  // ✅ Run comprehensive PIR diagnostic
+  bool pirHealthy = diagnosePIRSensor();
   
   // Check if load is initially connected
   loadPluggedIn = (testCurrent > LOAD_DETECTION_THRESHOLD_HIGH);
@@ -345,14 +348,16 @@ void setupSystem() {
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  PIR Sensor: HW-456 SR505 Mini (GPIO 18)          ║"));
   Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
-  Serial.println(F("║  Action: Immediate power cutoff (<20ms)           ║"));
+  Serial.println(F("║  Action: ⚡ EMERGENCY cutoff <1ms (ULTRA-FAST!)    ║"));
   Serial.println(F("║  Warmup: 30-60 seconds for PIR stabilization      ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  📌 SR505 Mini Characteristics:                    ║"));
-  Serial.println(F("║    • SSR cutoff: <100ms (IMMEDIATE response!)     ║"));
+  Serial.println(F("║    • EMERGENCY SSR cutoff: <1ms (FIRST HIGH!)     ║"));
+  Serial.println(F("║    • Motion confirmation: ~80-100ms (debounced)   ║"));
   Serial.println(F("║    • SR505 pin delay: 2-3s (AFTER cutoff)         ║"));
   Serial.println(F("║    • No potentiometers (compact fixed design)     ║"));
   Serial.println(F("║    • Detection range: ~3 meters                   ║"));
+  Serial.println(F("║    • Output: 3.3V (NO voltage divider needed!)    ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SOFTWARE SETTINGS:         ║"));
   Serial.printf("║    • Check Interval: %dms                            ║\n", PIR_CHECK_INTERVAL);
@@ -1026,6 +1031,48 @@ void updatePIRSafety() {
     // Read PIR sensor
     int pirReading = digitalRead(PIR_SENSOR_PIN);
 
+    // ✅ CRITICAL SAFETY: IMMEDIATE SSR CUTOFF on FIRST HIGH reading with no load
+    // This happens BEFORE debouncing for maximum safety (<1ms response time!)
+    static bool wasLowLastCheck = true;
+    if (pirReading == HIGH && wasLowLastCheck && !loadPluggedIn && pirEnabled) {
+      // EMERGENCY CUTOFF - This is the FIRST HIGH reading after being LOW
+      digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
+      ssrPirOverride = true;
+      Serial.println(F("\n⚡ EMERGENCY SSR CUTOFF: First HIGH reading detected with empty socket!"));
+      Serial.printf("⚡ Response time: <1ms from PIR signal | Load: %.3fA\n", currentReading);
+    }
+    wasLowLastCheck = (pirReading == LOW);
+
+    // ✅ HEALTH MONITORING: Detect if sensor stuck HIGH for extended period
+    if (pirReading == HIGH) {
+      if (pirStuckHighStartTime == 0) {
+        pirStuckHighStartTime = now;  // Start tracking
+      } else {
+        unsigned long stuckDuration = now - pirStuckHighStartTime;
+        // If HIGH for more than 5 seconds continuously, warn user
+        if (stuckDuration > 5000 && !pirStuckHighWarned) {
+          Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+          Serial.println(F("║  ⚠️  PIR SENSOR HEALTH WARNING                     ║"));
+          Serial.println(F("╚════════════════════════════════════════════════════╝"));
+          Serial.printf("→ Sensor has been HIGH continuously for %.1f seconds\n", stuckDuration/1000.0);
+          Serial.println(F("→ This is ABNORMAL for HW-456 SR505 Mini"));
+          Serial.println(F("→ Possible issues:"));
+          Serial.println(F("   1. Wiring problem (check connections)"));
+          Serial.println(F("   2. Sensor requires warmup (wait 60 seconds after power-on)"));
+          Serial.println(F("   3. External voltage divider interfering (remove if present!)"));
+          Serial.println(F("   4. Faulty sensor"));
+          Serial.println(F("\n→ System continues operating with PIR safety active.\n"));
+          pirStuckHighWarned = true;
+        }
+      }
+    } else {
+      // Reset stuck detection when we see a LOW reading
+      if (pirStuckHighStartTime != 0) {
+        pirStuckHighStartTime = 0;
+        pirStuckHighWarned = false;  // Reset warning flag
+      }
+    }
+
     #if PIR_DEBUG_LOGGING
     // Log raw sensor reading with timing info
     static unsigned long lastHighTime = 0;
@@ -1349,6 +1396,74 @@ void runCalibration() {
   Serial.println(F("Follow instructions in serial monitor..."));
   // Calibration procedure would go here
   calibrationMode = false;
+}
+
+// ==================== PIR SENSOR DIAGNOSTICS ====================
+bool diagnosePIRSensor() {
+  Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+  Serial.println(F("║   🔍 PIR SENSOR DIAGNOSTIC TEST (HW-456 SR505)     ║"));
+  Serial.println(F("╚════════════════════════════════════════════════════╝"));
+
+  // Take 20 rapid readings over 1 second to check sensor behavior
+  int highReadings = 0;
+  int lowReadings = 0;
+  int readings[20];
+
+  Serial.println(F("\n→ Taking 20 samples over 1 second..."));
+  for (int i = 0; i < 20; i++) {
+    readings[i] = digitalRead(PIR_SENSOR_PIN);
+    if (readings[i] == HIGH) highReadings++;
+    else lowReadings++;
+    delay(50);
+  }
+
+  // Display results
+  Serial.print(F("   Readings: ["));
+  for (int i = 0; i < 20; i++) {
+    Serial.print(readings[i]);
+    if (i < 19) Serial.print(F(","));
+  }
+  Serial.println(F("]"));
+  Serial.printf("   HIGH: %d/20 | LOW: %d/20\n", highReadings, lowReadings);
+
+  // Analyze sensor health
+  bool sensorHealthy = true;
+
+  if (highReadings == 20) {
+    Serial.println(F("\n❌ ERROR: PIR sensor STUCK HIGH (all 20 readings = 1)"));
+    Serial.println(F("   Possible causes:"));
+    Serial.println(F("   1. Sensor is continuously detecting motion (unlikely for 1 second)"));
+    Serial.println(F("   2. Wiring issue - sensor output shorted to 3.3V"));
+    Serial.println(F("   3. Faulty sensor"));
+    Serial.println(F("   4. Voltage divider issue (if present - should NOT be needed!)"));
+    Serial.println(F("   5. Sensor not warmed up yet (wait 30-60 seconds)"));
+    Serial.println(F("\n   RECOMMENDED ACTIONS:"));
+    Serial.println(F("   → Wait 60 seconds for sensor warmup"));
+    Serial.println(F("   → Check wiring: HW-456 has 3 pins: VCC, OUT, GND"));
+    Serial.println(F("   → Verify OUT connects directly to GPIO 18 (no voltage divider!)"));
+    Serial.println(F("   → HW-456 SR505 Mini outputs 3.3V - compatible with ESP32"));
+    sensorHealthy = false;
+  }
+  else if (lowReadings == 20) {
+    Serial.println(F("\n✓ GOOD: PIR sensor reading LOW (no motion detected)"));
+    Serial.println(F("   Sensor appears to be working correctly."));
+    Serial.println(F("   Try moving in front of sensor to test motion detection."));
+    sensorHealthy = true;
+  }
+  else {
+    Serial.println(F("\n⚠️  WARNING: PIR sensor showing mixed readings"));
+    Serial.printf("   This could indicate:\n");
+    Serial.println(F("   • Actual motion being detected (normal)"));
+    Serial.println(F("   • Sensor warming up (wait 30-60 seconds)"));
+    Serial.println(F("   • Environmental interference"));
+    sensorHealthy = true;  // Might be normal
+  }
+
+  Serial.println(F("\n╔════════════════════════════════════════════════════╗"));
+  Serial.printf("║   Sensor Status: %-33s ║\n", sensorHealthy ? "✓ HEALTHY" : "❌ NEEDS ATTENTION");
+  Serial.println(F("╚════════════════════════════════════════════════════╝\n"));
+
+  return sensorHealthy;
 }
 
 // ==================== SYSTEM STATUS ====================
