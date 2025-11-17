@@ -103,6 +103,10 @@ using namespace websockets;
 #define VOLTAGE_SAMPLES     100         // Number of voltage samples
 
 // ==================== PIR SAFETY SETTINGS ====================
+// IMPORTANT: HW-456 SR505-M has HARDWARE timer that keeps output HIGH after motion
+// - Adjustable via Tx potentiometer: 0.3s (min) to 200s (max)
+// - Set Tx to MINIMUM (turn counterclockwise fully) for fast response
+// - Pin stays HIGH for entire Tx duration even if motion stops
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds after motion stops
 #define PIR_CHECK_INTERVAL  20          // Check every 20ms (OPTIMIZED: was 50ms)
@@ -335,6 +339,11 @@ void setupSystem() {
   Serial.println(F("║  Protection: Empty socket + Motion detection      ║"));
   Serial.println(F("║  Action: Immediate power cutoff (<20ms)           ║"));
   Serial.println(F("║  Warmup: 30 seconds required for PIR stability    ║"));
+  Serial.println(F("║                                                    ║"));
+  Serial.println(F("║  ⚠️  HARDWARE ADJUSTMENT REQUIRED:                 ║"));
+  Serial.println(F("║    • Tx potentiometer: Set to MINIMUM (turn CCW)  ║"));
+  Serial.println(F("║    • Sx potentiometer: Adjust sensitivity as needed║"));
+  Serial.println(F("║    • If pin stays HIGH: Tx is set too high!       ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SETTINGS:                  ║"));
   Serial.printf("║    • Check Interval: %dms                            ║\n", PIR_CHECK_INTERVAL);
@@ -1009,7 +1018,22 @@ void updatePIRSafety() {
     int pirReading = digitalRead(PIR_SENSOR_PIN);
 
     #if PIR_DEBUG_LOGGING
-    // Log raw sensor reading
+    // Log raw sensor reading with timing info
+    static unsigned long lastHighTime = 0;
+    static unsigned long consecutiveHighCount = 0;
+
+    if (pirReading == HIGH) {
+      lastHighTime = now;
+      consecutiveHighCount++;
+    } else {
+      if (consecutiveHighCount > 0) {
+        unsigned long highDuration = now - (lastHighTime - (consecutiveHighCount * PIR_CHECK_INTERVAL));
+        Serial.printf("\n[PIR] Pin was HIGH for ~%lu ms (%lu readings)\n",
+                     highDuration, consecutiveHighCount);
+        consecutiveHighCount = 0;
+      }
+    }
+
     Serial.printf("[PIR] Raw Pin %d = %s | ", PIR_SENSOR_PIN, pirReading == HIGH ? "HIGH" : "LOW");
     #endif
 
