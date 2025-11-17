@@ -68,7 +68,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.0"
+#define DEVICE_VERSION      "7.1-PIR-OPTIMIZED"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -106,8 +106,8 @@ using namespace websockets;
 // IMPORTANT: HW-456 SR505 Mini has FIXED hardware timer (no potentiometers)
 //
 // SAFETY TIMING (UPDATED - FIXED FALSE TRIGGER ISSUES):
-// - EMERGENCY SSR CUTOFF: ~100ms after debounce confirmation ⚡
-// - Motion confirmation: ~100ms (4/5 readings at 20ms intervals)
+// - EMERGENCY SSR CUTOFF: ~15ms after debounce confirmation ⚡ OPTIMIZED ⚡
+// - Motion confirmation: ~15ms ⚡ OPTIMIZED (2/3 readings at 5ms intervals)
 // - SSR RELEASE: IMMEDIATE when motion stops (no delay!)
 // - SR505 pin stays HIGH: 2-3 seconds (sensor's built-in timer)
 // - Cooldown period: 10 seconds (prevents rapid re-triggers)
@@ -124,13 +124,13 @@ using namespace websockets;
 // - Added comprehensive logging to diagnose random toggling
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds cooldown after motion stops
-#define PIR_CHECK_INTERVAL  20          // Check every 20ms (OPTIMIZED: was 50ms)
-#define PIR_DEBOUNCE_TIME   60          // Debounce 60ms (OPTIMIZED: was 100ms)
+#define PIR_CHECK_INTERVAL  5          // ⚡ OPTIMIZED: 5ms (was 20ms) - 4x faster!
+#define PIR_DEBOUNCE_TIME   30          // Debounce 60ms (⚡ OPTIMIZED: 30ms (was 60ms))
 #define PIR_ALERT_BEEPS     3           // Number of alert beeps
-#define PIR_SENSITIVITY     5           // Number of readings for debounce (increased for stability)
-#define PIR_MOTION_CONFIRM_COUNT 4      // Require 4 out of 5 HIGH readings to confirm motion
-#define PIR_CLEAR_CONFIRM_COUNT  4      // Require 4 out of 5 LOW readings to confirm clear
-#define PIR_STATE_MIN_TIME  500         // Minimum time (ms) in state before transition (prevents oscillation)
+#define PIR_SENSITIVITY     3           // Number of readings for debounce (increased for stability)
+#define PIR_MOTION_CONFIRM_COUNT 2      // ⚡ OPTIMIZED: 2/3 readings (was 4/5) - faster trigger!
+#define PIR_CLEAR_CONFIRM_COUNT  2      // Require 4 out of 5 LOW readings to confirm clear
+#define PIR_STATE_MIN_TIME  250         // ⚡ OPTIMIZED: 250ms (was 500ms) - faster transitions!
 #define PIR_DEBUG_LOGGING   true        // Enable detailed PIR debug logs
 
 // ==================== SYSTEM SETTINGS ====================
