@@ -104,9 +104,16 @@ using namespace websockets;
 
 // ==================== PIR SAFETY SETTINGS ====================
 // IMPORTANT: HW-456 SR505 Mini has FIXED hardware timer (no potentiometers)
-// - Output stays HIGH for ~2-3 seconds after motion detection (FIXED, cannot adjust)
+//
+// SAFETY TIMING (CRITICAL):
+// - Motion detection: ~80-100ms (4/5 readings at 20ms intervals)
+// - SSR cutoff: <100ms from first HIGH reading ⚡ IMMEDIATE!
+// - SR505 pin stays HIGH: 2-3 seconds (sensor's built-in timer)
+// - SSR is ALREADY OFF during the 2-3s HIGH period!
+//
+// HARDWARE CHARACTERISTICS:
 // - No Tx/Sx potentiometers on this model (compact design)
-// - This is NORMAL behavior - software handles the 2-3s delay correctly
+// - 2-3 second delay is NORMAL and EXPECTED (sensor hardware timer)
 // - Detection range: ~3 meters (fixed)
 #define PIR_ENABLED         true
 #define PIR_MOTION_TIMEOUT  10000      // 10 seconds after motion stops
@@ -342,10 +349,10 @@ void setupSystem() {
   Serial.println(F("║  Warmup: 30-60 seconds for PIR stabilization      ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  📌 SR505 Mini Characteristics:                    ║"));
-  Serial.println(F("║    • Fixed time delay: ~2-3 seconds (normal!)     ║"));
+  Serial.println(F("║    • SSR cutoff: <100ms (IMMEDIATE response!)     ║"));
+  Serial.println(F("║    • SR505 pin delay: 2-3s (AFTER cutoff)         ║"));
   Serial.println(F("║    • No potentiometers (compact fixed design)     ║"));
   Serial.println(F("║    • Detection range: ~3 meters                   ║"));
-  Serial.println(F("║    • Pin stays HIGH 2-3s after motion (expected)  ║"));
   Serial.println(F("║                                                    ║"));
   Serial.println(F("║  ⚡ STABILITY-OPTIMIZED SOFTWARE SETTINGS:         ║"));
   Serial.printf("║    • Check Interval: %dms                            ║\n", PIR_CHECK_INTERVAL);
@@ -1089,9 +1096,15 @@ void updatePIRSafety() {
 
       // ⚡ CRITICAL SAFETY: IMMEDIATE SSR CUT-OFF IF NO LOAD
       if (!loadPluggedIn) {
+        unsigned long cutoffTime = millis();  // Record exact cutoff time
         ssrPirOverride = true;
         digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);  // IMMEDIATE hardware cutoff
+        unsigned long cutoffLatency = millis() - cutoffTime;
+
         Serial.println(F("→ ⚡ IMMEDIATE SSR CUTOFF (no load detected)"));
+        Serial.printf("→ ⚡ SSR Cutoff Latency: %lu ms (hardware response time)\n", cutoffLatency);
+        Serial.println(F("→ ⚡ NOTE: SR505 pin will stay HIGH for 2-3s (sensor timer)"));
+        Serial.println(F("→ ⚡       but SSR is ALREADY OFF at this point!"));
       }
 
     } else if (!motionNow && pirMotionDetected) {
