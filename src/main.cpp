@@ -933,14 +933,14 @@ void updateSensors() {
       if (consecutiveLoadLowReadings >= LOAD_CONFIRM_READINGS) {
         loadPluggedIn = false;
         consecutiveLoadLowReadings = 0;  // Reset counter
-        #if PIR_DEBUG_LOGGING
+
         Serial.println(F("\n╔══════════════════════════════════════════╗"));
         Serial.println(F("║  🔌 LOAD DISCONNECTED (CONFIRMED)        ║"));
         Serial.println(F("╚══════════════════════════════════════════╝"));
         Serial.printf("→ Current: %.3fA < %.2fA (threshold)\n", currentReading, LOAD_DETECTION_THRESHOLD_LOW);
         Serial.printf("→ Confirmed by %d consecutive readings\n", LOAD_CONFIRM_READINGS);
-        Serial.println(F("→ SSR may be disabled if motion detected\n"));
-        #endif
+        Serial.println(F("→ PIR MONITORING NOW ACTIVE"));
+        Serial.println(F("→ SSR will be disabled if motion detected\n"));
       }
     } else {
       // Still above threshold - reset counter
@@ -956,14 +956,14 @@ void updateSensors() {
       if (consecutiveLoadHighReadings >= LOAD_CONFIRM_READINGS) {
         loadPluggedIn = true;
         consecutiveLoadHighReadings = 0;  // Reset counter
-        #if PIR_DEBUG_LOGGING
+
         Serial.println(F("\n╔══════════════════════════════════════════╗"));
         Serial.println(F("║  🔌 LOAD CONNECTED (CONFIRMED)           ║"));
         Serial.println(F("╚══════════════════════════════════════════╝"));
         Serial.printf("→ Current: %.3fA > %.2fA (threshold)\n", currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
         Serial.printf("→ Confirmed by %d consecutive readings\n", LOAD_CONFIRM_READINGS);
-        Serial.println(F("→ PIR override will be released if active\n"));
-        #endif
+        Serial.println(F("→ PIR MONITORING DISABLED"));
+        Serial.println(F("→ PIR override released if active\n"));
       }
     } else {
       // Still below threshold - reset counter
@@ -1099,34 +1099,68 @@ void updatePIRSafety() {
   // PIR safety is only needed for empty sockets (child safety)
   // If something is already plugged in, no need to monitor
   if (loadPluggedIn) {
-    // Reset PIR state if it was active
-    if (pirState != PIR_IDLE || ssrPirOverride) {
-      Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
-      Serial.println(F("║  ✓ LOAD DETECTED - PIR MONITORING DISABLED   ✓   ║"));
-      Serial.println(F("╚═══════════════════════════════════════════════════╝"));
-      Serial.printf("→ Load Current: %.3f A (above %.2f A threshold)\n",
-                    currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
-      Serial.println(F("→ PIR monitoring paused - socket is not empty"));
-      Serial.println(F("→ SSR override released (if active)"));
-      Serial.println(F("→ PIR will resume when load is disconnected\n"));
+    // ALWAYS reset PIR state when load is present (prevent any lingering state)
+    if (pirState != PIR_IDLE || ssrPirOverride || pirMotionDetected) {
 
+      #if PIR_DEBUG_LOGGING
+      // Only log once when transitioning to disabled state
+      static bool disableLogged = false;
+      if (!disableLogged) {
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ✓ LOAD DETECTED - PIR MONITORING DISABLED   ✓   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ Load Current: %.3f A (above %.2f A threshold)\n",
+                      currentReading, LOAD_DETECTION_THRESHOLD_HIGH);
+        Serial.println(F("→ PIR monitoring paused - socket is not empty"));
+        Serial.println(F("→ SSR override released (if active)"));
+        Serial.println(F("→ PIR will resume when load is disconnected\n"));
+        disableLogged = true;
+      }
+      #endif
+
+      // Force reset ALL PIR state (critical for preventing false triggers)
       pirState = PIR_IDLE;
       ssrPirOverride = false;
       pirMotionDetected = false;
+      lastMotionTime = 0;
+      pirTriggerCount = 0;
 
-      // Reset PIR buffer
+      // Clear PIR buffer completely
       for (int i = 0; i < PIR_SENSITIVITY; i++) {
         pirReadings[i] = 0;
       }
       pirReadIndex = 0;
+      consecutiveMotionDetections = 0;
+      consecutiveClearDetections = 0;
 
       // Reset stuck sensor tracking
       pirStuckHighStartTime = 0;
       pirStuckHighWarned = false;
       pirStuckTimeoutActive = false;
+      pirStuckTimeoutStart = 0;
+    } else {
+      // Reset the disable log flag when state is already clean
+      #if PIR_DEBUG_LOGGING
+      static bool disableLogged = false;
+      disableLogged = false;
+      #endif
     }
+
     return;  // Skip all PIR monitoring while load is present
   }
+
+  // If we get here, load is NOT plugged in - PIR should be active
+  #if PIR_DEBUG_LOGGING
+  static bool enableLogged = false;
+  if (!enableLogged && !loadPluggedIn) {
+    Serial.println(F("\n[PIR] Socket is EMPTY - PIR monitoring ACTIVE\n"));
+    enableLogged = true;
+  }
+  // Reset flag when load is present
+  if (loadPluggedIn) {
+    enableLogged = false;
+  }
+  #endif
 
   unsigned long now = millis();
   unsigned long timeInCurrentState = now - pirStateEntryTime;
@@ -1479,6 +1513,18 @@ void controlSSR() {
   bool finalState;
   String stateReason = "";
 
+  // ✅ DIAGNOSTIC: Check for unexpected override states when load is present
+  if (loadPluggedIn && ssrPirOverride) {
+    Serial.println(F("\n⚠️⚠️⚠️ ANOMALY DETECTED ⚠️⚠️⚠️"));
+    Serial.println(F("PIR override is ACTIVE despite load being present!"));
+    Serial.printf("Load: %.3fA | PIR State: %d | Motion: %s\n",
+                  currentReading, pirState, pirMotionDetected ? "YES" : "NO");
+    Serial.println(F("Forcing PIR override OFF (load should disable PIR)"));
+    ssrPirOverride = false;  // Force it off
+    pirState = PIR_IDLE;
+    pirMotionDetected = false;
+  }
+
   // Priority order: Safety > PIR > Command
   if (ssrSafetyOverride) {
     // Critical safety override (overvoltage/overcurrent)
@@ -1488,6 +1534,13 @@ void controlSSR() {
     // PIR CHILD SAFETY OVERRIDE - IMMEDIATE OFF
     finalState = false;
     stateReason = "PIR_OVERRIDE";
+
+    // ✅ DIAGNOSTIC: Log unexpected PIR override
+    Serial.println(F("\n⚠️ PIR OVERRIDE ACTIVE - SSR FORCED OFF"));
+    Serial.printf("→ Current: %.3fA | Load: %s | PIR Motion: %s\n",
+                  currentReading, loadPluggedIn ? "YES" : "NO",
+                  pirMotionDetected ? "YES" : "NO");
+
     // Double-check it's really OFF for child safety
     digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
   } else {
