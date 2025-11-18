@@ -1573,11 +1573,20 @@ void controlSSR() {
     finalState = false;
     stateReason = "PIR_OVERRIDE";
 
-    // ✅ DIAGNOSTIC: Log unexpected PIR override
-    Serial.println(F("\n⚠️ PIR OVERRIDE ACTIVE - SSR FORCED OFF"));
-    Serial.printf("→ Current: %.3fA | Load: %s | PIR Motion: %s\n",
-                  currentReading, loadPluggedIn ? "YES" : "NO",
-                  pirMotionDetected ? "YES" : "NO");
+    // ✅ DIAGNOSTIC: Log unexpected PIR override every time it's active
+    static unsigned long lastPirOverrideLog = 0;
+    if (millis() - lastPirOverrideLog > 1000) {  // Log every second to avoid spam
+      Serial.println(F("\n⚠️⚠️⚠️ PIR OVERRIDE ACTIVE - SSR FORCED OFF ⚠️⚠️⚠️"));
+      Serial.printf("→ Current: %.3fA | Load: %s | PIR Motion: %s\n",
+                    currentReading, loadPluggedIn ? "YES" : "NO",
+                    pirMotionDetected ? "YES ✓" : "NO ❌ (should be YES!)");
+
+      if (!pirMotionDetected) {
+        Serial.println(F("→ 🔴 PROBLEM: Override is ON but motion is NOT detected!"));
+        Serial.println(F("   This is the bug causing unexpected relay OFF"));
+      }
+      lastPirOverrideLog = millis();
+    }
 
     // Double-check it's really OFF for child safety
     digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
@@ -1596,7 +1605,7 @@ void controlSSR() {
     Serial.printf("║  🔄 SSR STATE CHANGE: %s → %s\n",
                   lastFinalState ? "ON " : "OFF", finalState ? "ON " : "OFF");
     Serial.println(F("╚═══════════════════════════════════════════════════╝"));
-    Serial.printf("→ Reason: %s\n", stateReason.c_str());
+    Serial.printf("→ ⚠️⚠️ REASON: %s ⚠️⚠️\n", stateReason.c_str());
     Serial.printf("→ Time since last change: %lu ms\n", timeSinceLastChange);
     Serial.printf("→ PIR State: %s | Motion: %s | Load: %s (%.3fA)\n",
                   pirState == PIR_IDLE ? "IDLE" :
@@ -1608,7 +1617,36 @@ void controlSSR() {
     Serial.printf("→ Overrides: PIR=%s | Safety=%s\n",
                   ssrPirOverride ? "ACTIVE" : "inactive",
                   ssrSafetyOverride ? "ACTIVE" : "inactive");
-    Serial.printf("→ Command State: %s\n\n", ssrCommandState ? "ON" : "OFF");
+    Serial.printf("→ Command State: %s\n", ssrCommandState ? "ON" : "OFF");
+
+    // ✅ DETAILED PRIORITY ANALYSIS
+    Serial.println(F("\n--- WHY DID SSR CHANGE STATE? ---"));
+    if (ssrSafetyOverride) {
+      Serial.println(F("1. ⚠️ SAFETY OVERRIDE ACTIVE → Forced OFF (overvoltage/overcurrent)"));
+    } else if (ssrPirOverride) {
+      Serial.println(F("2. ⚠️⚠️ PIR OVERRIDE ACTIVE → Forced OFF (child safety)"));
+      Serial.printf("   PIR Motion Detected: %s\n", pirMotionDetected ? "YES" : "NO ❌");
+      Serial.printf("   Load Plugged In: %s\n", loadPluggedIn ? "YES" : "NO");
+
+      // ✅ SMOKING GUN DETECTOR
+      if (!pirMotionDetected) {
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║ 🔴 FOUND IT! PIR OVERRIDE WITHOUT MOTION 🔴      ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.println(F("→ This is why relay turns OFF when terminal shows 0!"));
+        Serial.println(F("→ PIR override flag is ACTIVE but motion = NO"));
+        Serial.println(F("→ Likely causes:"));
+        Serial.println(F("   1. PIR override stuck from previous event"));
+        Serial.println(F("   2. Race condition in state machine"));
+        Serial.println(F("   3. Motion cleared but override not released"));
+        Serial.println(F(""));
+      }
+    } else if (ssrCommandState) {
+      Serial.println(F("3. Command State = ON → SSR turned ON normally"));
+    } else {
+      Serial.println(F("3. Command State = OFF → SSR turned OFF by command"));
+    }
+    Serial.println();
 
     lastFinalState = finalState;
     lastStateChange = now;
