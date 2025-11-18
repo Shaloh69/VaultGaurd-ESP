@@ -1,5 +1,5 @@
 /*
- * VaultGuard v7.3 - SMART PIR MONITORING VERSION
+ * VaultGuard v7.4 - ENHANCED DEBUG VERSION WITH SMART PIR
  * Server: https://meifhi-esp-server.onrender.com
  *
  * ✅ FIXED FOR RENDER.COM DEPLOYMENT
@@ -7,6 +7,7 @@
  * ✅ DEVICE TYPE CORRECTED
  * ✅ SSL/TLS CONFIGURED FOR RENDER
  * ✅ SMART PIR: Only monitors when socket is EMPTY
+ * ✅ ENHANCED DEBUG: Real-time PIR monitoring logs
  *
  * FEATURES:
  * ✓ WebSocket bidirectional communication with SSL
@@ -17,6 +18,9 @@
  * ✓ Full server protocol compliance
  * ✓ Smart PIR child safety (only active for empty sockets)
  * ✓ Energy monitoring and reporting
+ * ✓ Real-time PIR debug logging (pin state, buffer, decisions)
+ * ✓ 10-second PIR status summaries
+ * ✓ Anomaly detection and auto-correction
  * 
  * SENSOR CALIBRATION:
  * ✓ ACS712 5A Current Sensor with offset correction
@@ -69,7 +73,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.3-PIR-SMART"
+#define DEVICE_VERSION      "7.4-PIR-ENHANCED-DEBUG"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -1172,6 +1176,12 @@ void updatePIRSafety() {
     // Read PIR sensor
     int pirReading = digitalRead(PIR_SENSOR_PIN);
 
+    #if PIR_DEBUG_LOGGING
+    // ✅ REAL-TIME PIR PIN MONITORING (shows every reading)
+    Serial.printf("[PIR-RAW] Time: %lu ms | Pin %d = %s | ",
+                  now, PIR_SENSOR_PIN, pirReading == HIGH ? "HIGH(1)" : "LOW(0)");
+    #endif
+
     // ✅ SR602 HEALTH MONITORING: Detect if sensor stuck HIGH for extended period
     if (pirReading == HIGH) {
       if (pirStuckHighStartTime == 0) {
@@ -1235,28 +1245,11 @@ void updatePIRSafety() {
       }
     }
 
-    #if PIR_DEBUG_LOGGING
-    // Log raw sensor reading with timing info
-    static unsigned long lastHighTime = 0;
-    static unsigned long consecutiveHighCount = 0;
-
-    if (pirReading == HIGH) {
-      lastHighTime = now;
-      consecutiveHighCount++;
-    } else {
-      if (consecutiveHighCount > 0) {
-        unsigned long highDuration = now - (lastHighTime - (consecutiveHighCount * PIR_CHECK_INTERVAL));
-        Serial.printf("\n[PIR] Pin was HIGH for ~%lu ms (%lu readings)\n",
-                     highDuration, consecutiveHighCount);
-        consecutiveHighCount = 0;
-      }
-    }
-
-    Serial.printf("[PIR] Raw Pin %d = %s | ", PIR_SENSOR_PIN, pirReading == HIGH ? "HIGH" : "LOW");
-    #endif
+    // ✅ Enhanced logging removed - we have real-time logging above now
 
     // Update circular buffer for debouncing
     pirReadings[pirReadIndex] = pirReading;
+    int currentBufferIndex = pirReadIndex;
     pirReadIndex = (pirReadIndex + 1) % PIR_SENSITIVITY;
 
     // Count HIGH readings in buffer
@@ -1266,30 +1259,64 @@ void updatePIRSafety() {
     }
 
     #if PIR_DEBUG_LOGGING
-    // Log buffer state and decision
-    Serial.printf("Buffer [");
+    // ✅ DETAILED BUFFER STATE (shows circular buffer contents)
+    Serial.printf("Buffer[");
     for (int i = 0; i < PIR_SENSITIVITY; i++) {
+      // Highlight the current position
+      if (i == currentBufferIndex) Serial.print(">");
       Serial.printf("%d", pirReadings[i]);
+      if (i == currentBufferIndex) Serial.print("<");
       if (i < PIR_SENSITIVITY - 1) Serial.print(",");
     }
-    Serial.printf("] | HIGH: %d/%d | ", highCount, PIR_SENSITIVITY);
+    Serial.printf("] | HIGH:%d/%d | ", highCount, PIR_SENSITIVITY);
     #endif
 
     // Determine motion state with IMPROVED HYSTERESIS
     bool motionNow = false;
+    String decisionReason = "";
+
     if (pirMotionDetected) {
       // Currently detecting motion - require clear confirmation to stop
-      motionNow = (highCount >= (PIR_SENSITIVITY - PIR_CLEAR_CONFIRM_COUNT + 1));
+      int clearThreshold = PIR_SENSITIVITY - PIR_CLEAR_CONFIRM_COUNT + 1;
+      motionNow = (highCount >= clearThreshold);
+
+      #if PIR_DEBUG_LOGGING
+      decisionReason = motionNow ?
+        "STILL_MOTION(need " + String(PIR_SENSITIVITY - clearThreshold + 1) + " LOW to clear)" :
+        "CLEARED(enough LOW readings)";
+      #endif
     } else {
       // Currently clear - require motion confirmation to start
       motionNow = (highCount >= PIR_MOTION_CONFIRM_COUNT);
+
+      #if PIR_DEBUG_LOGGING
+      decisionReason = motionNow ?
+        "MOTION_DETECTED(>=" + String(PIR_MOTION_CONFIRM_COUNT) + " HIGH)" :
+        "NO_MOTION(<" + String(PIR_MOTION_CONFIRM_COUNT) + " HIGH)";
+      #endif
     }
 
     #if PIR_DEBUG_LOGGING
-    Serial.printf("Decision: %s", motionNow ? "MOTION" : "CLEAR");
+    // ✅ DECISION LOGIC (shows why motion was/wasn't detected)
+    Serial.printf("=> %s", decisionReason.c_str());
+
+    // Show current state
+    Serial.printf(" | State: ");
+    switch(pirState) {
+      case PIR_IDLE: Serial.print("IDLE"); break;
+      case PIR_MOTION_NO_LOAD: Serial.print("MOTION_NO_LOAD"); break;
+      case PIR_MOTION_WITH_LOAD: Serial.print("MOTION_WITH_LOAD"); break;
+      case PIR_COOLDOWN: Serial.print("COOLDOWN"); break;
+    }
+
+    // Show load status
+    Serial.printf(" | Load: %s(%.3fA)",
+                  loadPluggedIn ? "YES" : "NO", currentReading);
+
+    Serial.println();  // End of line for this PIR reading cycle
     #endif
 
-    // Motion state changed - with event logging
+    // ✅ MOTION STATE CHANGE DETECTION (enhanced logging)
     if (motionNow && !pirMotionDetected) {
       pirMotionDetected = true;
       lastMotionTime = now;
@@ -1302,8 +1329,15 @@ void updatePIRSafety() {
                     pirTriggerCount, now, loadPluggedIn ? "CONNECTED" : "EMPTY", currentReading);
       Serial.printf("→ Confirmation: %d/%d HIGH readings in buffer\n",
                     highCount, PIR_SENSITIVITY);
-      Serial.printf("→ Detection after debouncing: ~%dms response time\n",
+      Serial.printf("→ Detection latency: ~%dms (debounce time)\n",
                     PIR_CHECK_INTERVAL * PIR_SENSITIVITY);
+      Serial.printf("→ PIR State before: ");
+      switch(pirState) {
+        case PIR_IDLE: Serial.println("IDLE"); break;
+        case PIR_MOTION_NO_LOAD: Serial.println("MOTION_NO_LOAD"); break;
+        case PIR_MOTION_WITH_LOAD: Serial.println("MOTION_WITH_LOAD"); break;
+        case PIR_COOLDOWN: Serial.println("COOLDOWN"); break;
+      }
 
       // ⚡ CRITICAL SAFETY: IMMEDIATE SSR CUT-OFF IF NO LOAD (after debounce confirmation)
       if (!loadPluggedIn && pirEnabled) {
@@ -1312,9 +1346,12 @@ void updatePIRSafety() {
         digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);  // IMMEDIATE hardware cutoff
         unsigned long cutoffLatency = micros() - cutoffTime;
 
-        Serial.println(F("→ ⚡ IMMEDIATE SSR CUTOFF (confirmed motion, no load)"));
-        Serial.printf("→ ⚡ SSR Cutoff Latency: %lu μs (hardware response time)\n", cutoffLatency);
-        Serial.println(F("→ ⚡ Motion confirmed via debouncing (reduces false triggers)"));
+        Serial.println(F("→ ⚡ EMERGENCY ACTION: IMMEDIATE SSR CUTOFF"));
+        Serial.printf("→ ⚡ SSR Cutoff Latency: %lu μs (hardware write time)\n", cutoffLatency);
+        Serial.println(F("→ ⚡ Reason: Motion detected + Empty socket (DANGER)"));
+        Serial.println(F("→ ⚡ Child safety protection ACTIVATED"));
+      } else if (loadPluggedIn) {
+        Serial.println(F("→ ✓ No SSR action needed (load present - safe)"));
       }
 
     } else if (!motionNow && pirMotionDetected) {
@@ -1324,18 +1361,19 @@ void updatePIRSafety() {
       Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
       Serial.println(F("║  ✓ MOTION STOPPED - PIR SENSOR CLEAR         ✓   ║"));
       Serial.println(F("╚═══════════════════════════════════════════════════╝"));
-      Serial.printf("→ Motion Duration: %lu ms | Trigger Count: %d\n",
-                    motionDuration, pirTriggerCount);
+      Serial.printf("→ Motion Duration: %lu ms (%.2f seconds)\n",
+                    motionDuration, motionDuration/1000.0);
+      Serial.printf("→ Total Triggers: %d\n", pirTriggerCount);
       Serial.printf("→ Confirmation: Only %d/%d HIGH readings in buffer\n",
                     highCount, PIR_SENSITIVITY);
+      Serial.printf("→ PIR State: ");
+      switch(pirState) {
+        case PIR_IDLE: Serial.println("IDLE"); break;
+        case PIR_MOTION_NO_LOAD: Serial.println("MOTION_NO_LOAD (will transition)"); break;
+        case PIR_MOTION_WITH_LOAD: Serial.println("MOTION_WITH_LOAD (will transition)"); break;
+        case PIR_COOLDOWN: Serial.println("COOLDOWN"); break;
+      }
     }
-
-    #if PIR_DEBUG_LOGGING
-    // Add newline for debug logs
-    if (!motionNow && pirMotionDetected == false) {
-      Serial.println(); // Clean log separation
-    }
-    #endif
   }
 
   // ========== STEP 2: STATE MACHINE WITH TRANSITION GUARDS ==========
@@ -1930,9 +1968,34 @@ void loop() {
     lastDataSend = millis();
   }
   
-  // Print status every 30 seconds
+  // ✅ PIR MONITORING STATUS - Print every 10 seconds
+  static unsigned long lastPirStatus = 0;
+  if (millis() - lastPirStatus >= 10000) {
+    Serial.println(F("\n╔════════════ PIR MONITORING STATUS ═════════════╗"));
+    Serial.printf("║ PIR Enabled: %-10s | Monitoring: %-10s ║\n",
+                  pirEnabled ? "YES" : "NO",
+                  (pirEnabled && !loadPluggedIn) ? "ACTIVE" : "DISABLED");
+    Serial.printf("║ Motion: %-10s | Load: %-10s(%.2fA) ║\n",
+                  pirMotionDetected ? "DETECTED" : "CLEAR",
+                  loadPluggedIn ? "CONNECTED" : "EMPTY",
+                  currentReading);
+    Serial.printf("║ PIR State: %-27s ║\n",
+                  pirState == PIR_IDLE ? "IDLE" :
+                  pirState == PIR_MOTION_NO_LOAD ? "MOTION_NO_LOAD" :
+                  pirState == PIR_MOTION_WITH_LOAD ? "MOTION_WITH_LOAD" :
+                  "COOLDOWN");
+    Serial.printf("║ SSR Override: %-10s | SSR: %-10s      ║\n",
+                  ssrPirOverride ? "ACTIVE" : "inactive",
+                  ssrEnabled ? "ON" : "OFF");
+    Serial.printf("║ Triggers: %-4d | Uptime: %-10lu sec      ║\n",
+                  pirTriggerCount, (millis() - systemStartTime) / 1000);
+    Serial.println(F("╚════════════════════════════════════════════════╝\n"));
+    lastPirStatus = millis();
+  }
+
+  // Print full status every 60 seconds
   static unsigned long lastStatusPrint = 0;
-  if (millis() - lastStatusPrint >= 30000) {
+  if (millis() - lastStatusPrint >= 60000) {
     printStatus();
     lastStatusPrint = millis();
   }
