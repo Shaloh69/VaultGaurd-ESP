@@ -1102,14 +1102,20 @@ void updatePIRSafety() {
   // ✅ DISABLE PIR MONITORING IF LOAD IS PLUGGED IN
   // PIR safety is only needed for empty sockets (child safety)
   // If something is already plugged in, no need to monitor
+
+  #if PIR_DEBUG_LOGGING
+  // Move static variables outside conditional blocks to avoid naming conflicts
+  static bool pirLoadDetectedLogged = false;
+  static bool pirSocketEmptyLogged = false;
+  #endif
+
   if (loadPluggedIn) {
     // ALWAYS reset PIR state when load is present (prevent any lingering state)
     if (pirState != PIR_IDLE || ssrPirOverride || pirMotionDetected) {
 
       #if PIR_DEBUG_LOGGING
       // Only log once when transitioning to disabled state
-      static bool disableLogged = false;
-      if (!disableLogged) {
+      if (!pirLoadDetectedLogged) {
         Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
         Serial.println(F("║  ✓ LOAD DETECTED - PIR MONITORING DISABLED   ✓   ║"));
         Serial.println(F("╚═══════════════════════════════════════════════════╝"));
@@ -1118,7 +1124,8 @@ void updatePIRSafety() {
         Serial.println(F("→ PIR monitoring paused - socket is not empty"));
         Serial.println(F("→ SSR override released (if active)"));
         Serial.println(F("→ PIR will resume when load is disconnected\n"));
-        disableLogged = true;
+        pirLoadDetectedLogged = true;
+        pirSocketEmptyLogged = false;  // Reset the opposite flag
       }
       #endif
 
@@ -1145,8 +1152,7 @@ void updatePIRSafety() {
     } else {
       // Reset the disable log flag when state is already clean
       #if PIR_DEBUG_LOGGING
-      static bool disableLogged = false;
-      disableLogged = false;
+      pirLoadDetectedLogged = false;
       #endif
     }
 
@@ -1155,14 +1161,10 @@ void updatePIRSafety() {
 
   // If we get here, load is NOT plugged in - PIR should be active
   #if PIR_DEBUG_LOGGING
-  static bool enableLogged = false;
-  if (!enableLogged && !loadPluggedIn) {
+  if (!pirSocketEmptyLogged && !loadPluggedIn) {
     Serial.println(F("\n[PIR] Socket is EMPTY - PIR monitoring ACTIVE\n"));
-    enableLogged = true;
-  }
-  // Reset flag when load is present
-  if (loadPluggedIn) {
-    enableLogged = false;
+    pirSocketEmptyLogged = true;
+    pirLoadDetectedLogged = false;  // Reset the opposite flag
   }
   #endif
 
