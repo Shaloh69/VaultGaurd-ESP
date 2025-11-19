@@ -84,7 +84,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.5-PRODUCTION-OPTIMIZED"
+#define DEVICE_VERSION      "7.5.1-FAST-COOLDOWN"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -139,7 +139,8 @@ using namespace websockets;
 // - Motion confirmation: ~15ms (2/3 readings at 5ms intervals)
 // - SSR RELEASE: IMMEDIATE when motion stops (no delay!)
 // - SR602 pin stays HIGH: 5-200+ seconds (depends on Tx potentiometer setting)
-// - Cooldown period: 10 seconds (prevents rapid re-triggers)
+// - Cooldown period: 2 seconds (fast return to IDLE, still monitors during cooldown!)
+// - Cooldown re-trigger: 50ms (fast response if motion detected during cooldown)
 // - Stuck sensor timeout: 300 seconds (auto-recovery if sensor stuck HIGH)
 //
 // 🛡️ ENHANCED PROTECTIONS:
@@ -149,7 +150,7 @@ using namespace websockets;
 // - SR602-aware debouncing for long HIGH periods
 //
 #define PIR_ENABLED         true
-#define PIR_MOTION_TIMEOUT  10000      // 10 seconds cooldown after motion stops
+#define PIR_MOTION_TIMEOUT  2000       // ✅ v7.5.1: 2 seconds cooldown (reduced from 10s for faster response)
 #define PIR_CHECK_INTERVAL  5          // 5ms polling interval
 #define PIR_DEBOUNCE_TIME   30         // 30ms debounce time
 #define PIR_ALERT_BEEPS     3          // Number of alert beeps
@@ -157,6 +158,7 @@ using namespace websockets;
 #define PIR_MOTION_CONFIRM_COUNT 2     // Need 2/3 readings HIGH to confirm motion
 #define PIR_CLEAR_CONFIRM_COUNT  2     // Need 2/3 readings LOW to confirm clear
 #define PIR_STATE_MIN_TIME  250        // Minimum time in state before transition (anti-oscillation)
+#define PIR_COOLDOWN_RETRIGGER_TIME 50 // ✅ v7.5.1: Fast re-trigger during cooldown (50ms vs 250ms)
 #define PIR_DEBUG_LOGGING   true       // Enable detailed PIR debug logs
 
 // ✅ SR602-SPECIFIC SETTINGS
@@ -1585,8 +1587,11 @@ void updatePIRSafety() {
       break;
 
     case PIR_COOLDOWN:
-      // Wait for cooldown period to complete
-      // Note: SSR override was already released when entering this state
+      // ✅ v7.5.1: COOLDOWN DOES NOT HOLD SSR OFF!
+      // - Override was released when entering this state
+      // - SSR can be ON during cooldown (normal operation)
+      // - Still monitoring for motion (fast re-trigger if detected)
+
       if (now - lastMotionTime >= PIR_MOTION_TIMEOUT) {
         // Cooldown complete - return to IDLE
         pirState = PIR_IDLE;
@@ -1595,29 +1600,42 @@ void updatePIRSafety() {
         Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
         Serial.println(F("║  ✓ COOLDOWN COMPLETE - SYSTEM READY          ✓   ║"));
         Serial.println(F("╚═══════════════════════════════════════════════════╝"));
-        Serial.printf("→ State Transition: PIR_COOLDOWN → PIR_IDLE\n");
+        Serial.printf("→ State Transition: PIR_COOLDOWN → PIR_IDLE (%d seconds elapsed)\n",
+                      PIR_MOTION_TIMEOUT/1000);
         Serial.println(F("→ Normal operation resumed. PIR monitoring active.\n"));
       }
 
+      // ✅ v7.5.1: FAST RE-TRIGGER during cooldown for safety!
       // If motion detected again during cooldown - evaluate immediately (safety critical)
-      if (pirMotionDetected && timeInCurrentState >= PIR_STATE_MIN_TIME) {
-        Serial.println(F("\n→ PIR: Motion detected during cooldown!"));
+      // Using reduced guard time (50ms vs 250ms) for faster response
+      if (pirMotionDetected && timeInCurrentState >= PIR_COOLDOWN_RETRIGGER_TIME) {
+        Serial.println(F("\n╔═══════════════════════════════════════════════════╗"));
+        Serial.println(F("║  ⚡ MOTION DETECTED DURING COOLDOWN!          ⚡   ║"));
+        Serial.println(F("╚═══════════════════════════════════════════════════╝"));
+        Serial.printf("→ Re-trigger time: %lu ms (fast response: %d ms guard)\n",
+                      timeInCurrentState, PIR_COOLDOWN_RETRIGGER_TIME);
 
         if (loadPluggedIn) {
           // Safe - load present
           pirState = PIR_MOTION_WITH_LOAD;
           pirStateEntryTime = now;
-          Serial.printf("   Load present (%.3f A) → Transitioning to PIR_MOTION_WITH_LOAD\n",
+          Serial.printf("→ Load present (%.3f A) → Transitioning to PIR_MOTION_WITH_LOAD\n",
                        currentReading);
+          Serial.println(F("→ No SSR action needed (safe)\n"));
         } else {
           // DANGER - no load, activate override immediately
           pirState = PIR_MOTION_NO_LOAD;
           pirStateEntryTime = now;
           ssrPirOverride = true;
+          ssrPirOverrideStartTime = now;  // Start watchdog timer
           digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);  // Immediate cutoff
           lastMotionTime = now;  // Reset cooldown timer
-          Serial.printf("   Empty socket (%.3f A) → EMERGENCY CUTOFF ACTIVATED!\n",
+
+          Serial.printf("→ Empty socket (%.3f A) → ⚡ EMERGENCY CUTOFF RE-ACTIVATED!\n",
                        currentReading);
+          Serial.printf("→ Response time from motion detection: ~%d ms\n",
+                       PIR_COOLDOWN_RETRIGGER_TIME);
+          Serial.println(F("→ SSR forced OFF for child safety\n"));
         }
       }
       break;
