@@ -42,14 +42,14 @@
  * BEFORE UPLOADING:
  * 1. Replace "YOUR_WIFI_SSID" with your WiFi name
  * 2. Replace "YOUR_WIFI_PASSWORD" with your WiFi password
- * 3. Connect PZEM-004T: RX→GPIO3 (RX0), TX→GPIO1 (TX0), 5V, GND
+ * 3. Connect PZEM-004T: RX→GPIO16 (RX2), TX→GPIO17 (TX2), 5V, GND
  * 4. Connect SSR: IN→GPIO14, VCC, GND
- * 5. ⚠️ WARNING: Serial debugging will NOT work after upload (UART0 used for PZEM)
+ * 5. ✅ Serial debugging works! (UART2 used for PZEM, UART0 free for USB)
  * 6. Upload to ESP32
  *
  * Created: 2025
  * Author: VaultGuard Team
- * Version: 7.6 - PZEM-004T Integration
+ * Version: 7.6 - PZEM-004T Integration (UART2 Fix)
  */
 
 #include <Arduino.h>
@@ -65,11 +65,11 @@
 using namespace websockets;
 
 // ==================== PIN DEFINITIONS ====================
-// ⚠️ WARNING: Using UART0 (RX0/TX0) for PZEM-004T will disable USB serial debugging!
-// RX0 (GPIO 3) and TX0 (GPIO 1) are normally used for USB programming/debugging.
-// After upload, Serial Monitor will not work. Consider using UART2 (GPIO 16/17) instead.
-#define PZEM_RX_PIN         3       // PZEM-004T RX connected to ESP32 RX0 (GPIO 3)
-#define PZEM_TX_PIN         1       // PZEM-004T TX connected to ESP32 TX0 (GPIO 1)
+// ✅ FIXED: Using UART2 (GPIO 16/17) for PZEM-004T to allow USB programming
+// GPIO 16 (RX2) and GPIO 17 (TX2) are free to use for PZEM communication
+// This allows normal USB upload and Serial Monitor debugging
+#define PZEM_RX_PIN         16      // PZEM-004T RX connected to ESP32 RX2 (GPIO 16)
+#define PZEM_TX_PIN         17      // PZEM-004T TX connected to ESP32 TX2 (GPIO 17)
 #define SSR_CONTROL_PIN     14      // Solid State Relay control (changed to GPIO 14)
 #define RED_LED_PIN         2       // Error/Warning LED
 #define GREEN_LED_PIN       4       // Status OK LED
@@ -241,9 +241,9 @@ int httpRetryCount = 0;
 bool renderServerAwake = false;                                 // ✅ Track Render server state
 
 // PZEM-004T Energy Monitor
-// ⚠️ WARNING: Using UART0 (Serial) - USB debugging will not work after this!
-// If you need Serial debugging, change to Serial2 (GPIO 16/17) instead
-PZEM004Tv30 pzem(Serial, PZEM_RX_PIN, PZEM_TX_PIN);
+// ✅ FIXED: Using UART2 (Serial2) - USB upload and debugging now work normally!
+// Serial2 uses GPIO 16 (RX2) and GPIO 17 (TX2)
+PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
 
 // Sensor readings
 float currentReading = 0.0;
@@ -351,14 +351,13 @@ bool validatePIRStateTransition(PIRState fromState, PIRState toState);  // ✅ v
 
 // ==================== SETUP ====================
 void setup() {
-  // ⚠️ WARNING: Serial.begin() initializes UART0 for USB debugging
-  // This will be reconfigured for PZEM-004T in setupSystem()
-  // After PZEM init, USB Serial Monitor will NOT work!
+  // ✅ Serial.begin() initializes UART0 for USB debugging (always works!)
+  // PZEM-004T uses UART2 (GPIO 16/17) - no conflict with USB
   Serial.begin(115200);
   delay(1000);
 
   Serial.println(F("\n\n════════════════════════════════════════════════════════"));
-  Serial.println(F("   VAULTGUARD v7.5 - PZEM-004T VERSION"));
+  Serial.println(F("   VAULTGUARD v7.6 - PZEM-004T VERSION (UART2)"));
   Serial.println(F("════════════════════════════════════════════════════════"));
   Serial.printf("Device ID: %s\n", DEVICE_ID);
   Serial.printf("Device Type: %s\n", DEVICE_TYPE);
@@ -366,7 +365,7 @@ void setup() {
   Serial.printf("Server: %s:%d\n", SERVER_HOST, SERVER_PORT);
   Serial.println(F("\n⚡ HARDWARE CHANGES:"));
   Serial.println(F("  • PZEM-004T Energy Monitor (replaces ACS712 + ZMPT101B)"));
-  Serial.println(F("  • UART0 (RX0/TX0) for PZEM communication"));
+  Serial.println(F("  • UART2 (GPIO 16/17) for PZEM - USB upload works!"));
   Serial.println(F("  • SSR on GPIO 14 (changed from GPIO 5)"));
   Serial.println(F("\n⚡ v7.5 FEATURES:"));
   Serial.println(F("  • Immediate PIR override release (no stuck overrides!)"));
@@ -409,13 +408,12 @@ void setupSystem() {
 
   Serial.println(F("✓ GPIO pins initialized"));
 
-  // ⚠️ IMPORTANT: PZEM-004T initialization
-  // The PZEM object was already created globally and uses UART0 (RX0/TX0)
-  // After this point, Serial Monitor via USB will NOT work!
+  // ✅ PZEM-004T initialization
+  // The PZEM object uses UART2 (GPIO 16/17) - USB Serial Monitor works!
   // PZEM communication happens at 9600 baud via Modbus RTU protocol
   Serial.println(F("\n→ Initializing PZEM-004T Energy Monitor..."));
-  Serial.println(F("   ⚠️ WARNING: Serial debugging will stop after PZEM init!"));
-  Serial.println(F("   ⚠️ UART0 (RX0/TX0) will be used for PZEM communication"));
+  Serial.println(F("   ✅ Using UART2 (GPIO 16/17) - Serial debugging works!"));
+  Serial.println(F("   ✅ USB upload and Serial Monitor fully functional"));
   delay(500);
 
   // Test PZEM sensors
