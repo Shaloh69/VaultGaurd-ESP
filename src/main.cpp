@@ -885,13 +885,12 @@ void sendDataToServer() {
   status["wifiRSSI"] = WiFi.RSSI();
   status["wsConnected"] = wsConnected;
   
-  // Calibration info
+  // Calibration info (simplified for PZEM-004T)
   JsonObject calibration = doc.createNestedObject("calibration");
-  calibration["currentOffset"] = calData.currentOffset;
-  calibration["voltageOffset"] = calData.voltageOffset;
-  calibration["currentCal"] = calData.currentCalibration;
-  calibration["voltageCal"] = calData.voltageCalibration;
+  calibration["powerFactorCal"] = calData.powerFactorCalibration;
   calibration["calibrationCount"] = calData.calibrationCount;
+  calibration["sensorType"] = "PZEM-004T";
+  calibration["factoryCalibrated"] = true;
   
   String jsonData;
   serializeJson(doc, jsonData);
@@ -2081,11 +2080,10 @@ void printStatus() {
   Serial.printf("PIR override: %s\n", ssrPirOverride ? "ACTIVE" : "INACTIVE");
   Serial.printf("Safety override: %s\n", ssrSafetyOverride ? "ACTIVE" : "INACTIVE");
   
-  Serial.println(F("\n--- CALIBRATION ---"));
-  Serial.printf("Current offset: %.3f V, calibration: %.3f\n", 
-                calData.currentOffset, calData.currentCalibration);
-  Serial.printf("Voltage offset: %.3f V, calibration: %.3f\n", 
-                calData.voltageOffset, calData.voltageCalibration);
+  Serial.println(F("\n--- CALIBRATION (PZEM-004T) ---"));
+  Serial.println(F("Sensor: PZEM-004T (Factory Calibrated)"));
+  Serial.println(F("Accuracy: 0.5% (V/I/P), 1% (PF)"));
+  Serial.printf("Power Factor Calibration: %.2f\n", calData.powerFactorCalibration);
   Serial.printf("Calibration count: %lu\n", calData.calibrationCount);
   
   Serial.println(F("========================================\n"));
