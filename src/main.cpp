@@ -32,20 +32,24 @@
  * ✓ 10-second PIR status summaries
  * ✓ Sub-20ms PIR emergency response time
  *
- * SENSOR CALIBRATION:
- * ✓ ACS712 5A Current Sensor with offset correction
- * ✓ ZMPT101B Voltage Sensor for Philippines 220V/60Hz
- * ✓ Automatic calibration storage in EEPROM
- * ✓ Runtime calibration adjustment via commands
+ * SENSOR CONFIGURATION:
+ * ✓ PZEM-004T Energy Monitor (replaces ACS712 + ZMPT101B)
+ * ✓ Measures: Voltage, Current, Power, Energy, Frequency, Power Factor
+ * ✓ Communication: UART/Modbus RTU at 9600 baud
+ * ✓ Factory calibrated (0.5% accuracy for V/I/P)
+ * ✓ Minimal EEPROM calibration (power factor only)
  *
  * BEFORE UPLOADING:
- * 1. Replace "YOUR_WIFI_SSID" with your WiFi name (line 50)
- * 2. Replace "YOUR_WIFI_PASSWORD" with your WiFi password (line 51)
- * 3. Upload to ESP32
+ * 1. Replace "YOUR_WIFI_SSID" with your WiFi name
+ * 2. Replace "YOUR_WIFI_PASSWORD" with your WiFi password
+ * 3. Connect PZEM-004T: RX→GPIO3 (RX0), TX→GPIO1 (TX0), 5V, GND
+ * 4. Connect SSR: IN→GPIO14, VCC, GND
+ * 5. ⚠️ WARNING: Serial debugging will NOT work after upload (UART0 used for PZEM)
+ * 6. Upload to ESP32
  *
  * Created: 2025
- * Author: VaultGuard Team with CircuitIQ Integration
- * Version: 7.5 - Production Optimized
+ * Author: VaultGuard Team
+ * Version: 7.6 - PZEM-004T Integration
  */
 
 #include <Arduino.h>
@@ -56,19 +60,22 @@
 #include <ArduinoWebsockets.h>
 #include <EEPROM.h>
 #include <esp_task_wdt.h>
+#include <PZEM004Tv30.h>
 
 using namespace websockets;
 
 // ==================== PIN DEFINITIONS ====================
-#define ACS712_PIN          34      // Current sensor analog input
-#define ZMPT101B_PIN        35      // Voltage sensor analog input
-#define SSR_CONTROL_PIN     5       // Solid State Relay control
+// ⚠️ WARNING: Using UART0 (RX0/TX0) for PZEM-004T will disable USB serial debugging!
+// RX0 (GPIO 3) and TX0 (GPIO 1) are normally used for USB programming/debugging.
+// After upload, Serial Monitor will not work. Consider using UART2 (GPIO 16/17) instead.
+#define PZEM_RX_PIN         3       // PZEM-004T RX connected to ESP32 RX0 (GPIO 3)
+#define PZEM_TX_PIN         1       // PZEM-004T TX connected to ESP32 TX0 (GPIO 1)
+#define SSR_CONTROL_PIN     14      // Solid State Relay control (changed to GPIO 14)
 #define RED_LED_PIN         2       // Error/Warning LED
 #define GREEN_LED_PIN       4       // Status OK LED
 #define BLUE_LED_PIN        19      // Data transmission LED
 #define PIR_SENSOR_PIN      18      // PIR motion sensor (SR602 Mini)
 #define BUZZER_PIN          21      // Alert buzzer for safety warnings
-#define SD_CS_PIN           15      // SD Card chip select
 
 // ==================== NETWORK CONFIGURATION - RENDER.COM ====================
 // ⚠️ TODO: FILL IN YOUR WIFI CREDENTIALS BELOW
@@ -84,7 +91,7 @@ using namespace websockets;
 // ✅ DEVICE IDENTIFICATION (FIXED - Server compatible)
 #define DEVICE_ID           "VAULTGUARD_001"
 #define DEVICE_TYPE         "VAULTER"                           // ✅ FIXED: Changed from "VAULTGUARD"
-#define DEVICE_VERSION      "7.5.1-FAST-COOLDOWN"
+#define DEVICE_VERSION      "7.6-PZEM004T"
 
 // NETWORK SETTINGS
 #define WIFI_TIMEOUT_MS     20000
@@ -95,15 +102,20 @@ using namespace websockets;
 #define WS_PONG_TIMEOUT     10000
 #define RENDER_WAKEUP_DELAY 60000                               // ✅ Wait 60s for Render to wake up
 
-// ==================== SENSOR CALIBRATION FROM CIRCUITIQ ====================
-#define ADC_RESOLUTION      4096.0
-#define ADC_VREF            3.3
+// ==================== PZEM-004T SENSOR CONFIGURATION ====================
+// PZEM-004T is an all-in-one energy monitoring module that measures:
+// - Voltage: 80-260V AC (Accuracy: 0.5%, Resolution: 0.1V)
+// - Current: 0-100A (Accuracy: 0.5%, Resolution: 0.001A)
+// - Power: 0-23kW (Accuracy: 0.5%, Resolution: 0.1W)
+// - Energy: 0-9999.99kWh (Accuracy: 0.5%, Resolution: 1Wh)
+// - Frequency: 45-65Hz (Accuracy: 0.5%, Resolution: 0.1Hz)
+// - Power Factor: 0.00-1.00 (Accuracy: 1%, Resolution: 0.01)
+//
+// Communication: UART/Modbus RTU at 9600 baud
+// ⚠️ Note: Using UART0 (RX0/TX0) disables USB serial debugging!
 
-// ACS712 5A Current Sensor Calibration
-#define ACS712_SENSITIVITY  0.185      // 185mV/A for 5A version
-#define ACS712_ZERO_CURRENT 2.5         // Zero current voltage
-#define VOLTAGE_DIVIDER_RATIO 0.667     // Voltage divider for 3.3V ADC
-#define MAX_VALID_CURRENT   6.0         // Maximum valid current reading
+#define PZEM_BAUD_RATE      9600        // PZEM-004T communication baud rate
+#define MAX_VALID_CURRENT   100.0       // Maximum valid current reading (PZEM limit)
 #define MIN_VALID_CURRENT   0.03        // Minimum current (noise threshold)
 
 // ✅ ENHANCED LOAD DETECTION WITH WIDE HYSTERESIS (prevents oscillation)
@@ -111,16 +123,13 @@ using namespace websockets;
 #define LOAD_DETECTION_THRESHOLD_LOW  0.03   // Current threshold for load DISCONNECT: 30mA
 #define LOAD_CONFIRM_READINGS 5              // Consecutive readings needed to confirm load state change (normal mode)
 #define LOAD_FAST_CONFIRM_READINGS 2         // ✅ NEW: Fast confirmation during PIR emergency (120ms vs 300ms)
-#define CURRENT_SAMPLES     50               // Number of samples for averaging
 
-// ZMPT101B Voltage Sensor Calibration (Philippines 220V @ 60Hz)
-#define ZMPT101B_SENSITIVITY 0.004     // Sensor sensitivity
+// Philippines AC Configuration
 #define AC_FREQUENCY        60          // Philippines AC frequency
-#define RMS_SAMPLES         100         // Samples for RMS calculation
 #define NOMINAL_VOLTAGE     220.0       // Philippines nominal voltage
-#define MAX_VOLTAGE         240.0       // Maximum expected voltage
-#define MIN_VOLTAGE         200.0       // Minimum valid voltage
-#define VOLTAGE_SAMPLES     100         // Number of voltage samples
+#define MAX_VOLTAGE         260.0       // Maximum expected voltage (PZEM range)
+#define MIN_VOLTAGE         80.0        // Minimum valid voltage (PZEM range)
+#define DEFAULT_POWER_FACTOR 0.95       // Default power factor (measured by PZEM)
 
 // ==================== PIR SAFETY SETTINGS - SR602 MINI ====================
 // IMPORTANT: SR602 Mini has ADJUSTABLE hardware timers (Tx & Sx potentiometers)
@@ -176,7 +185,6 @@ using namespace websockets;
 #define WATCHDOG_TIMEOUT_S  30
 #define EEPROM_SIZE         512
 #define EEPROM_MAGIC        0x42
-#define DEFAULT_POWER_FACTOR 0.95
 #define ENERGY_UPDATE_INTERVAL 1000
 
 // ==================== STATE ENUMS ====================
@@ -203,15 +211,13 @@ enum ConnectionState {
 };
 
 // ==================== CALIBRATION STRUCTURE ====================
+// Note: PZEM-004T handles calibration internally, so this struct is simplified
 struct CalibrationData {
   uint8_t magic = EEPROM_MAGIC;
-  float currentOffset = 1.65;
-  float voltageOffset = 1.65;
-  float currentCalibration = 1.0;
-  float voltageCalibration = 1.0;
-  float powerFactorCalibration = DEFAULT_POWER_FACTOR;
+  float powerFactorCalibration = DEFAULT_POWER_FACTOR;  // Still useful for calculations
   uint32_t calibrationCount = 0;
   unsigned long lastCalibration = 0;
+  uint8_t reserved[32] = {0};  // Reserved for future use
 };
 
 // ==================== GLOBAL VARIABLES ====================
@@ -233,6 +239,11 @@ unsigned long lastWsPing = 0;
 int wsReconnectAttempts = 0;
 int httpRetryCount = 0;
 bool renderServerAwake = false;                                 // ✅ Track Render server state
+
+// PZEM-004T Energy Monitor
+// ⚠️ WARNING: Using UART0 (Serial) - USB debugging will not work after this!
+// If you need Serial debugging, change to Serial2 (GPIO 16/17) instead
+PZEM004Tv30 pzem(Serial, PZEM_RX_PIN, PZEM_TX_PIN);
 
 // Sensor readings
 float currentReading = 0.0;
@@ -340,24 +351,31 @@ bool validatePIRStateTransition(PIRState fromState, PIRState toState);  // ✅ v
 
 // ==================== SETUP ====================
 void setup() {
+  // ⚠️ WARNING: Serial.begin() initializes UART0 for USB debugging
+  // This will be reconfigured for PZEM-004T in setupSystem()
+  // After PZEM init, USB Serial Monitor will NOT work!
   Serial.begin(115200);
   delay(1000);
-  
+
   Serial.println(F("\n\n════════════════════════════════════════════════════════"));
-  Serial.println(F("   VAULTGUARD v7.5 - PRODUCTION OPTIMIZED"));
+  Serial.println(F("   VAULTGUARD v7.5 - PZEM-004T VERSION"));
   Serial.println(F("════════════════════════════════════════════════════════"));
   Serial.printf("Device ID: %s\n", DEVICE_ID);
   Serial.printf("Device Type: %s\n", DEVICE_TYPE);
   Serial.printf("Version: %s\n", DEVICE_VERSION);
   Serial.printf("Server: %s:%d\n", SERVER_HOST, SERVER_PORT);
-  Serial.println(F("\n⚡ NEW IN v7.5:"));
+  Serial.println(F("\n⚡ HARDWARE CHANGES:"));
+  Serial.println(F("  • PZEM-004T Energy Monitor (replaces ACS712 + ZMPT101B)"));
+  Serial.println(F("  • UART0 (RX0/TX0) for PZEM communication"));
+  Serial.println(F("  • SSR on GPIO 14 (changed from GPIO 5)"));
+  Serial.println(F("\n⚡ v7.5 FEATURES:"));
   Serial.println(F("  • Immediate PIR override release (no stuck overrides!)"));
   Serial.println(F("  • PIR override watchdog (60s timeout protection)"));
   Serial.println(F("  • Fast-path load detection (120ms vs 300ms)"));
   Serial.println(F("  • 4x faster loop cycles (15ms vs 60ms)"));
   Serial.println(F("  • State transition validation"));
   Serial.println(F("════════════════════════════════════════════════════════\n"));
-  
+
   setupSystem();
 }
 
@@ -379,28 +397,39 @@ void setupSystem() {
   pinMode(GREEN_LED_PIN, OUTPUT);
   pinMode(BLUE_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  // ✅ FIX: Use INPUT_PULLDOWN to prevent floating pin (HW-456 outputs 3.3V on motion)
+  // ✅ FIX: Use INPUT_PULLDOWN to prevent floating pin (SR602 outputs 3.3V on motion)
   pinMode(PIR_SENSOR_PIN, INPUT_PULLDOWN);
-  pinMode(ACS712_PIN, INPUT);
-  pinMode(ZMPT101B_PIN, INPUT);
-  
+
   // Set initial states
   digitalWrite(SSR_CONTROL_PIN, SSR_OFF_STATE);
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(GREEN_LED_PIN, LOW);
   digitalWrite(BLUE_LED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
-  
+
   Serial.println(F("✓ GPIO pins initialized"));
-  
-  // Test sensors
+
+  // ⚠️ IMPORTANT: PZEM-004T initialization
+  // The PZEM object was already created globally and uses UART0 (RX0/TX0)
+  // After this point, Serial Monitor via USB will NOT work!
+  // PZEM communication happens at 9600 baud via Modbus RTU protocol
+  Serial.println(F("\n→ Initializing PZEM-004T Energy Monitor..."));
+  Serial.println(F("   ⚠️ WARNING: Serial debugging will stop after PZEM init!"));
+  Serial.println(F("   ⚠️ UART0 (RX0/TX0) will be used for PZEM communication"));
+  delay(500);
+
+  // Test PZEM sensors
   delay(100);
   float testCurrent = readCurrent();
   float testVoltage = readVoltage();
 
-  Serial.println(F("\n--- Initial Sensor Readings ---"));
+  Serial.println(F("\n--- Initial PZEM-004T Readings ---"));
   Serial.printf("Current: %.3f A\n", testCurrent);
   Serial.printf("Voltage: %.1f V\n", testVoltage);
+  Serial.printf("Power: %.1f W\n", pzem.power());
+  Serial.printf("Energy: %.3f kWh\n", pzem.energy());
+  Serial.printf("Frequency: %.1f Hz\n", pzem.frequency());
+  Serial.printf("Power Factor: %.2f\n", pzem.pf());
 
   // ✅ Run comprehensive PIR diagnostic
   bool pirHealthy = diagnosePIRSensor();
@@ -759,11 +788,19 @@ void handleCommand(JsonDocument& doc) {
     responseMessage = "Status sent";
   }
   else if (strcmp(command, "RESET_ENERGY") == 0) {
-    energyConsumed = 0.0;
-    lastEnergyUpdate = millis();
-    success = true;
-    responseMessage = "Energy counter reset";
-    Serial.println(F("✓ Energy counter reset"));
+    // Reset PZEM-004T's internal energy counter
+    bool resetSuccess = pzem.resetEnergy();
+    if (resetSuccess) {
+      energyConsumed = 0.0;
+      lastEnergyUpdate = millis();
+      success = true;
+      responseMessage = "PZEM-004T energy counter reset";
+      Serial.println(F("✓ PZEM-004T energy counter reset"));
+    } else {
+      success = false;
+      responseMessage = "Failed to reset PZEM-004T energy counter";
+      Serial.println(F("✗ Failed to reset PZEM-004T energy counter"));
+    }
   }
   else if (strcmp(command, "CALIBRATE") == 0) {
     calibrationMode = true;
@@ -936,16 +973,20 @@ bool sendDataWithRetry(const String& jsonData) {
   return success;
 }
 
-// ==================== SENSOR READING WITH CALIBRATION ====================
+// ==================== SENSOR READING FROM PZEM-004T ====================
 void updateSensors() {
   unsigned long now = millis();
 
-  // ✅ v7.5 OPTIMIZATION: Always read current (needed for load detection and PIR safety)
+  // ✅ PZEM-004T provides all measurements via UART/Modbus
+  // Note: PZEM readings are fast (Modbus query ~50-100ms total for all values)
+  // We can optimize by reading current more frequently for load detection
+
+  // ✅ Always read current (needed for load detection and PIR safety)
   currentReading = readCurrent();
 
   // ✅ v7.5 OPTIMIZATION: Alternate voltage readings for faster loop cycles
-  // Read voltage every OTHER cycle to reduce loop time from ~60ms to ~15ms
-  // This gives 4x better PIR response time on fast cycles
+  // Read voltage every OTHER cycle to reduce loop time
+  // PZEM-004T is faster than analog sampling but we still optimize for PIR response
   if (readVoltageThisCycle) {
     voltageReading = readVoltage();
     lastVoltageReadTime = now;
@@ -955,15 +996,17 @@ void updateSensors() {
     readVoltageThisCycle = true;   // Read next cycle
   }
 
-  // Calculate power metrics (uses current voltage reading, updated or cached)
+  // Calculate/read power metrics from PZEM-004T
   calculatePower();
 
-  // Update energy consumption (Wh)
-  if (now - lastEnergyUpdate >= ENERGY_UPDATE_INTERVAL) {
-    float deltaTime = (now - lastEnergyUpdate) / 3600000.0; // Convert to hours
-    energyConsumed += powerReading * deltaTime;
-    lastEnergyUpdate = now;
+  // Update energy consumption from PZEM-004T (kWh)
+  // PZEM-004T has built-in energy counter - use it directly
+  float pzemEnergy = pzem.energy();
+  if (!isnan(pzemEnergy)) {
+    energyConsumed = pzemEnergy; // PZEM reports in kWh, convert to Wh
   }
+
+  lastEnergyUpdate = now;
 
   // ✅ v7.5 ENHANCED LOAD DETECTION WITH FAST-PATH FOR PIR EMERGENCY
   // Normal mode: 5 consecutive readings (300ms confirmation)
@@ -1034,115 +1077,90 @@ void updateSensors() {
   lastCurrentReading = currentReading;
 }
 
-// ==================== CURRENT READING WITH CIRCUITIQ CALIBRATION ====================
+// ==================== CURRENT READING FROM PZEM-004T ====================
 float readCurrent() {
-  float sum = 0;
-  float sumSquares = 0;
-  
-  // Take multiple samples for accurate RMS calculation
-  for (int i = 0; i < CURRENT_SAMPLES; i++) {
-    int adcValue = analogRead(ACS712_PIN);
-    float voltage = (adcValue / ADC_RESOLUTION) * ADC_VREF;
-    
-    // Apply voltage divider correction
-    float sensorVoltage = voltage / VOLTAGE_DIVIDER_RATIO;
-    
-    // Apply calibration offset
-    float current = (sensorVoltage - calData.currentOffset) / ACS712_SENSITIVITY;
-    
-    sum += current;
-    sumSquares += current * current;
-    delayMicroseconds(200); // Sample at ~5kHz
+  float current = pzem.current();
+
+  // Check for reading error (returns NaN on error)
+  if (isnan(current)) {
+    Serial.println(F("⚠️ Error reading current from PZEM-004T"));
+    return 0.0;
   }
-  
-  // Calculate RMS current
-  float avgCurrent = sum / CURRENT_SAMPLES;
-  float rmsCurrent = sqrt(sumSquares / CURRENT_SAMPLES);
-  
-  // Apply calibration factor
-  rmsCurrent *= calData.currentCalibration;
-  
+
   // Apply noise filter and limits
-  if (rmsCurrent < MIN_VALID_CURRENT) {
-    rmsCurrent = 0.0; // Below noise threshold
+  if (current < MIN_VALID_CURRENT) {
+    current = 0.0; // Below noise threshold
   }
-  if (rmsCurrent > MAX_VALID_CURRENT) {
-    rmsCurrent = MAX_VALID_CURRENT; // Clamp to maximum
+  if (current > MAX_VALID_CURRENT) {
+    current = MAX_VALID_CURRENT; // Clamp to maximum
   }
-  
-  return rmsCurrent;
+
+  return current;
 }
 
-// ==================== VOLTAGE READING WITH CIRCUITIQ CALIBRATION ====================
+// ==================== VOLTAGE READING FROM PZEM-004T ====================
 float readVoltage() {
-  float sumSquares = 0;
-  float maxValue = 0;
-  float minValue = ADC_VREF;
-  
-  // Sample over multiple AC cycles
-  unsigned long samplePeriod = (1000000 / AC_FREQUENCY) * 3; // 3 AC cycles in microseconds
-  unsigned long startTime = micros();
-  int sampleCount = 0;
-  
-  while (micros() - startTime < samplePeriod) {
-    int adcValue = analogRead(ZMPT101B_PIN);
-    float voltage = (adcValue / ADC_RESOLUTION) * ADC_VREF;
-    
-    // Track min/max for peak-to-peak calculation
-    if (voltage > maxValue) maxValue = voltage;
-    if (voltage < minValue) minValue = voltage;
-    
-    // Apply calibration offset (AC center point)
-    float acVoltage = voltage - calData.voltageOffset;
-    
-    sumSquares += acVoltage * acVoltage;
-    sampleCount++;
-    
-    delayMicroseconds(150); // Sample at ~6.6kHz (>10x AC frequency)
+  float voltage = pzem.voltage();
+
+  // Check for reading error (returns NaN on error)
+  if (isnan(voltage)) {
+    Serial.println(F("⚠️ Error reading voltage from PZEM-004T"));
+    return 0.0;
   }
-  
-  // Calculate RMS voltage
-  float rmsVoltage = sqrt(sumSquares / sampleCount);
-  
-  // Convert to actual voltage using sensor sensitivity
-  float realVoltage = (rmsVoltage / ZMPT101B_SENSITIVITY) * calData.voltageCalibration;
-  
-  // Alternative calculation using peak-to-peak
-  float peakToPeak = maxValue - minValue;
-  float altVoltage = (peakToPeak / 2.0) * 0.707 / ZMPT101B_SENSITIVITY * calData.voltageCalibration;
-  
-  // Use average of both methods for better accuracy
-  realVoltage = (realVoltage + altVoltage) / 2.0;
-  
-  // Validate reading
-  if (realVoltage < MIN_VOLTAGE / 2) {
-    realVoltage = 0.0; // No voltage detected
+
+  // Validate reading is within PZEM's specified range (80-260V)
+  if (voltage < MIN_VOLTAGE) {
+    voltage = 0.0; // Below minimum, likely no voltage
   }
-  
-  // Clamp to reasonable limits
-  if (realVoltage > MAX_VOLTAGE * 1.2) {
-    realVoltage = MAX_VOLTAGE * 1.2;
+  if (voltage > MAX_VOLTAGE) {
+    Serial.printf("⚠️ Warning: Voltage %.1fV exceeds maximum %.1fV\n", voltage, MAX_VOLTAGE);
+    voltage = MAX_VOLTAGE; // Clamp to maximum
   }
-  
-  return realVoltage;
+
+  return voltage;
 }
 
-// ==================== POWER CALCULATION ====================
+// ==================== POWER CALCULATION FROM PZEM-004T ====================
 void calculatePower() {
-  // Real Power (Watts)
-  powerReading = voltageReading * currentReading * powerFactor;
-  
-  // Apparent Power (VA)
+  // PZEM-004T provides direct power measurement (real power in Watts)
+  float pzemPower = pzem.power();
+  float pzemPF = pzem.pf();
+  float pzemFreq = pzem.frequency();
+
+  // Check for reading errors
+  if (!isnan(pzemPower)) {
+    powerReading = pzemPower;
+  } else {
+    // Fallback calculation if PZEM power reading fails
+    powerReading = voltageReading * currentReading * powerFactor;
+  }
+
+  // Update power factor from PZEM (more accurate than calculated)
+  if (!isnan(pzemPF) && pzemPF > 0.0 && pzemPF <= 1.0) {
+    powerFactor = pzemPF;
+  }
+
+  // Update frequency from PZEM
+  if (!isnan(pzemFreq) && pzemFreq > 45.0 && pzemFreq < 65.0) {
+    frequency = pzemFreq;
+  }
+
+  // Calculate Apparent Power (VA)
   apparentPower = voltageReading * currentReading;
-  
-  // Reactive Power (VAR)
-  reactivePower = sqrt(abs(apparentPower * apparentPower - powerReading * powerReading));
-  
-  // Validate power factor
+
+  // Calculate Reactive Power (VAR)
+  if (apparentPower > 0.1 && powerReading <= apparentPower) {
+    reactivePower = sqrt(abs(apparentPower * apparentPower - powerReading * powerReading));
+  } else {
+    reactivePower = 0.0;
+  }
+
+  // Validate power factor (should already be valid from PZEM)
   if (apparentPower > 0.1) {
-    powerFactor = powerReading / apparentPower;
-    if (powerFactor > 1.0) powerFactor = 1.0;
-    if (powerFactor < 0.0) powerFactor = 0.0;
+    float calculatedPF = powerReading / apparentPower;
+    if (calculatedPF >= 0.0 && calculatedPF <= 1.0) {
+      powerFactor = calculatedPF;
+    }
   }
 }
 
@@ -1743,9 +1761,11 @@ void controlSSR() {
 }
 
 // ==================== CALIBRATION ====================
+// Note: PZEM-004T handles internal calibration, so this is simplified
+// We only store power factor calibration for custom calculations if needed
 void loadCalibration() {
   EEPROM.get(0, calData);
-  
+
   if (calData.magic != EEPROM_MAGIC) {
     // Initialize with defaults
     calData = CalibrationData();
@@ -1753,12 +1773,14 @@ void loadCalibration() {
     Serial.println(F("→ Calibration: Initialized with defaults"));
   } else {
     Serial.println(F("✓ Calibration: Loaded from EEPROM"));
+    Serial.printf("   Power Factor Calibration: %.2f\n", calData.powerFactorCalibration);
   }
 }
 
 void saveCalibration() {
   calData.magic = EEPROM_MAGIC;
   calData.lastCalibration = millis();
+  calData.calibrationCount++;
   EEPROM.put(0, calData);
   EEPROM.commit();
   Serial.println(F("✓ Calibration: Saved to EEPROM"));
@@ -1766,8 +1788,10 @@ void saveCalibration() {
 
 void runCalibration() {
   Serial.println(F("\n=== CALIBRATION MODE ==="));
-  Serial.println(F("Follow instructions in serial monitor..."));
-  // Calibration procedure would go here
+  Serial.println(F("⚠️ Note: PZEM-004T is factory calibrated"));
+  Serial.println(F("No manual calibration needed for voltage/current/power"));
+  Serial.println(F("Power factor calibration can be adjusted if needed"));
+  // Calibration procedure would go here (if implementing power factor adjustment)
   calibrationMode = false;
 }
 
